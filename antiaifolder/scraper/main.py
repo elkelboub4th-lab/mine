@@ -32,7 +32,7 @@ GROQ_MODELS = [
     "gemma2-9b-it",
 ]
 
-# Ouedkniss iPhone search — no login required, fully public
+# Correct URL (what Ouedkniss actually resolves to)
 SCRAPE_URL = "https://www.ouedkniss.com/s/1?keywords=iphone"
 
 # ── Notifications ─────────────────────────────────────────────────────────────
@@ -81,8 +81,8 @@ Title: "{title}"
 Price string: "{raw_price}"
 
 1. Detect iPhone model (e.g. "iPhone 13 Pro Max"). Unknown → "Unknown".
-2. Extract real price in DZD. Algerians sometimes write "150 000", "150k", or "150.000".
-3. Is the price fake or missing? (e.g. 0, 1, "Prix non spécifié") → is_fake_price: true.
+2. Extract real price in DZD. Algerians write "150 000", "150k", "150.000", "150 000 DA".
+3. Is the price fake or missing? (0, 1, "Prix non spécifié", empty) → is_fake_price: true.
 4. Estimate current market price in DZD.
 5. is_steal = true if (market_price - listing_price) > 20000 DZD.
 
@@ -111,7 +111,7 @@ Respond with JSON ONLY:
 # ── Listing Processing ────────────────────────────────────────────────────────
 
 def process_listings(listings):
-    print(f"Processing {len(listings)} new listings...")
+    print(f"Processing {len(listings)} unique listings...")
     for item in listings:
         ext_id = hash_id(item["url"], item["title"])
         if is_seen(ext_id):
@@ -158,11 +158,7 @@ def scrape_ouedkniss():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-            ],
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
         context = browser.new_context(
             user_agent=(
@@ -179,73 +175,66 @@ def scrape_ouedkniss():
         try:
             page.goto(SCRAPE_URL, timeout=60000)
 
-            # Ouedkniss is a Vue SPA — wait for the listing cards to render
-            page.wait_for_selector(".ok-announce-list-item, .v-card, article", timeout=30000)
-            page.wait_for_timeout(2000)  # let lazy images / prices finish loading
+            # Wait for Vue to mount cards — use "attached" not "visible"
+            # because Ouedkniss cards exist in DOM before they're fully painted
+            page.wait_for_selector(".v-card", state="attached", timeout=30000)
+
+            # Extra wait for prices/lazy content to populate
+            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_timeout(1500)
 
             print(f"Page title: {page.title()}")
 
-            listings = []
+            listings   = []
+            seen_urls  = set()
 
-            # --- Strategy 1: find all announce card links ---
-            # Ouedkniss listing URLs look like /detail/some-slug/XXXXXXX
+            # Ouedkniss detail links look like /detail/some-title/12345678
             cards = page.query_selector_all("a[href*='/detail/']")
-            print(f"Strategy 1 found {len(cards)} card links.")
+            print(f"Found {len(cards)} detail links.")
 
             for card in cards:
                 href = card.get_attribute("href")
                 if not href:
                     continue
                 full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
 
-                # Each card contains the title and price as text
-                text = card.inner_text().strip()
+                text  = card.inner_text().strip()
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-                if len(lines) >= 2:
-                    # Ouedkniss cards: title first, price somewhere below
-                    title = lines[0]
-                    # Find the price line — it usually contains digits and "DA" or "DZD"
-                    price = next(
-                        (l for l in lines[1:] if any(c.isdigit() for c in l)),
-                        lines[-1]
-                    )
+                if not lines:
+                    continue
+
+                title = lines[0]
+
+                # Price line: first line after title that contains a digit
+                price = next(
+                    (l for l in lines[1:] if any(c.isdigit() for c in l)),
+                    "Prix non spécifié"
+                )
+
+                if len(title) > 5:  # skip empty/garbage titles
                     listings.append({"title": title, "price": price, "url": full_url})
-
-            # --- Strategy 2 fallback: grab titles and prices separately ---
-            if not listings:
-                print("Strategy 1 empty, trying strategy 2...")
-                titles = page.query_selector_all(".ok-announce-title, h3, h2")
-                prices = page.query_selector_all(".ok-announce-price, .price")
-                links  = page.query_selector_all("a[href*='/detail/']")
-
-                for i, title_el in enumerate(titles):
-                    title = title_el.inner_text().strip()
-                    price = prices[i].inner_text().strip() if i < len(prices) else "Prix non spécifié"
-                    href  = links[i].get_attribute("href") if i < len(links) else ""
-                    if title and href:
-                        full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
-                        listings.append({"title": title, "price": price, "url": full_url})
-
-            # Deduplicate by URL
-            seen_urls = set()
-            unique = []
-            for l in listings:
-                if l["url"] not in seen_urls:
-                    seen_urls.add(l["url"])
-                    unique.append(l)
-            listings = unique
 
             print(f"Found {len(listings)} unique listings.")
 
             if not listings:
-                print("No listings found. Page snippet:")
-                print(page.content()[:600])
+                # Debug: dump a snippet so we can fix selectors
+                print("No listings extracted. HTML snippet:")
+                print(page.content()[2000:3000])
             else:
                 process_listings(listings)
 
         except Exception as e:
             print(f"Scrape error: {e}")
+            # Dump page content to debug selector issues
+            try:
+                print("Page snippet for debugging:")
+                print(page.content()[2000:3000])
+            except Exception:
+                pass
         finally:
             browser.close()
 
@@ -266,7 +255,7 @@ def run_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    print("SwoopDZ Scraper v3.0 — Ouedkniss Edition")
+    print("SwoopDZ Scraper v3.1 — Ouedkniss Edition")
     while True:
         scrape_ouedkniss()
         print("Sleeping 60s...")
