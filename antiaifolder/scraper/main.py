@@ -184,7 +184,7 @@ def process_listings(listings):
 
 def scrape_facebook():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, channel="chromium-headless-shell")
         page = browser.new_page()
         stealth_sync(page)
 
