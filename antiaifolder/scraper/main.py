@@ -172,70 +172,150 @@ def scrape_ouedkniss():
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 900},
+            locale="fr-DZ",
+            timezone_id="Africa/Algiers",
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "fr-DZ,fr;q=0.9,en;q=0.8",
+                "Connection": "keep-alive",
+            },
         )
         page = context.new_page()
         
-        # Inject stealth to avoid bot detection
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Stealth scripts
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['fr-DZ', 'fr', 'en']});
+        """)
         
-        print(f"Scraping {SCRAPE_URL} ...")
-
+        # Log requests for debugging
+        page.on("response", lambda r: print(f"  📡 {r.status} {r.url.split('?')[0][-60:]}") 
+                if "ouedkniss" in r.url and r.status >= 400 else None)
+        
+        print(f"🔍 Scraping {SCRAPE_URL} ...")
+        
         try:
-            # Use 'domcontentloaded' first, then wait for the dynamic content
-            page.goto(SCRAPE_URL, timeout=90000, wait_until="domcontentloaded")
+            # Go to page and wait for initial load
+            page.goto(SCRAPE_URL, wait_until="domcontentloaded", timeout=60000)
             
-            # Wait for the main content area to appear (more reliable than specific links)
-            # Ouedkniss uses a main layout container
-            page.wait_for_selector("main", timeout=30000)
+            # Handle cookie consent if present
+            try:
+                for btn_sel in ["button.cp-accept", "#onetrust-accept-btn-handler", "button[data-cookie-accept]"]:
+                    btn = page.query_selector(btn_sel)
+                    if btn and btn.is_visible():
+                        print("  🍪 Accepting cookies...")
+                        btn.click()
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                        break
+            except:
+                pass  # No cookie banner or already accepted
             
-            # Additional wait for Vue/Nuxt to hydrate and render items
-            page.wait_for_timeout(5000)
-
+            # ✅ CRITICAL: Wait for Vue to hydrate listings
+            # Ouedkniss uses <article class="o-announ-card"> or <div class="v-card">
+            card_selectors = [
+                "article.o-announ-card",
+                ".o-announ-card", 
+                ".v-card.annonce-card",
+                "[data-testid='annonce-card']",
+                "article.annonce"
+            ]
+            
+            card_found = False
+            for selector in card_selectors:
+                try:
+                    page.wait_for_selector(selector, state="attached", timeout=12000)
+                    print(f"  ✓ Cards found with: {selector}")
+                    card_found = True
+                    break
+                except:
+                    continue
+            
+            if not card_found:
+                print("  ❌ No listing cards found — page may be blocked or empty")
+                _debug_dump(page, "no_cards")
+                browser.close()
+                return
+            
+            # Wait for network to settle + Vue hydration
+            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_timeout(2500)  # Extra buffer for lazy-loaded prices
+            
+            # ✅ Extract listings with robust selectors
             listings = []
             seen_urls = set()
-
-            # The current structure uses 'v-card' and links containing '/annonces/'
-            # We search for all links and then filter in Python for better reliability
-            potential_links = page.query_selector_all("a")
             
-            for link in potential_links:
-                href = link.get_attribute("href")
-                if not href or "/annonces/" not in href:
-                    continue
-                
-                full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
-                if full_url in seen_urls:
-                    continue
-                seen_urls.add(full_url)
-
-                # Extract text using a more robust approach
-                text = link.inner_text().strip()
-                if not text:
-                    continue
-                
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-                
-                if len(lines) >= 2:
-                    # In current Ouedkniss cards, the first line is usually the title
-                    title = lines[0]
-                    # Search through lines for anything resembling a price (DA, digits, etc)
-                    price = "Prix non spécifié"
-                    for line in lines:
-                        if any(char.isdigit() for char in line) and ("DA" in line or "دج" in line):
-                            price = line
-                            break
+            # Get all cards first, then extract data from each
+            cards = page.query_selector_all("article.o-announ-card, .o-announ-card, .v-card.annonce-card")
+            print(f"  📦 Found {len(cards)} card elements")
+            
+            for card in cards:
+                try:
+                    # Extract link
+                    link_el = card.query_selector("a[href]")
+                    if not link_el:
+                        continue
+                    href = link_el.get_attribute("href") or ""
                     
-                    if len(title) > 5:
-                        listings.append({"title": title, "price": price, "url": full_url})
-
-            print(f"Found {len(listings)} listings.")
+                    # Normalize URL
+                    if href.startswith("/"):
+                        full_url = f"https://www.ouedkniss.com{href}"
+                    elif href.startswith("http"):
+                        full_url = href
+                    else:
+                        continue
+                    
+                    # Validate it's an annonce page
+                    if "/annonces/" not in full_url or (".htm" not in full_url and ".html" not in full_url):
+                        continue
+                    if full_url in seen_urls:
+                        continue
+                    seen_urls.add(full_url)
+                    
+                    # Extract title & price with CSS selectors FIRST
+                    title_el = card.query_selector("h3, .o-announ-card-title, .card-title, .titre_annonce")
+                    price_el = card.query_selector("span.price, .prix, .o-announ-card-price, .card-price, .montant")
+                    
+                    title = title_el.inner_text().strip() if title_el else ""
+                    price = price_el.inner_text().strip() if price_el else ""
+                    
+                    # Fallback: parse from innerText if selectors fail
+                    if not title or len(title) < 4:
+                        text = card.inner_text().strip()
+                        lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 3]
+                        if lines:
+                            title = lines[0]
+                            # Find price: line with digits + DA/dj/دج
+                            for line in lines[1:5]:
+                                if any(c.isdigit() for c in line) and any(k in line.lower() for k in ["da", "دج", "dj", "000", " k", "k "]):
+                                    price = line
+                                    break
+                    
+                    # Only keep if title looks valid
+                    if title and len(title) > 5 and "iphone" in title.lower():
+                        listings.append({
+                            "title": title,
+                            "price": price if price else "Prix non spécifié",
+                            "url": full_url
+                        })
+                        
+                except Exception as e:
+                    print(f"  ⚠ Error parsing card: {e}")
+                    continue
+            
+            print(f"✅ Extracted {len(listings)} valid iPhone listings")
+            
             if listings:
                 process_listings(listings)
             else:
-                print("No listings found. The page might be empty or blocked.")
-
+                print("  ⚠ No valid listings after filtering — dumping debug HTML")
+                _debug_dump(page, "no_valid_listings")
+                
         except Exception as e:
-            print(f"Scrape error: {e}")
+            print(f"❌ Scrape error: {e}")
+            import traceback
+            traceback.print_exc()
+            _debug_dump(page, "scrape_error")
         finally:
             browser.close()
 
