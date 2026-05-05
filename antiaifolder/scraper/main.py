@@ -8,7 +8,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from groq import Groq
-from typing import List, Dict, Optional, Any
 
 load_dotenv()
 
@@ -19,22 +18,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 NTFY_TOPIC   = os.getenv("NTFY_TOPIC")
 NTFY_URL     = os.getenv("NTFY_URL", "https://ntfy.sh")
 
-if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
-    print("Error: Missing environment variables.")
-    exit(1)
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama3-8b-8192", "mixtral-8x7b-32768"]
-
-# GraphQL Config
-GRAPHQL_URL = "https://api.ouedkniss.com/graphql"
-SEARCH_KEYWORDS = "iphone"
-
 # ── Notifications ────────────────────────────────────────────────────────────
 
-def send_ntfy(title: str, body: str):
+def send_ntfy(title, body):
     try:
         requests.post(f"{NTFY_URL}/{NTFY_TOPIC}", 
                       data=body.encode("utf-8"), 
@@ -53,19 +42,23 @@ def mark_seen(ext_id: str):
     try: supabase.table("seen_listings").insert({"external_id": ext_id}).execute()
     except: pass
 
-# ── GraphQL Scraper (Fixed with Headers) ─────────────────────────────────────
+# ── Optimized Scraper (Inspired by abdelhak-k/OuedKniss-Scraper) ──────────────
 
 def get_ouedkniss_listings():
-    # MANDATORY HEADERS: Without these, the API returns an empty char 0 error
+    url = "https://api.ouedkniss.com/graphql"
+    
+    # These specific headers prevent the "empty response" error
     headers = {
         "Content-Type": "application/json",
-        "Accept": "*/*",
+        "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "X-Ouedkniss-Version": "2024-05-15",
+        "X-App-Language": "fr",
         "Origin": "https://www.ouedkniss.com",
         "Referer": "https://www.ouedkniss.com/",
-        "X-Ouedkniss-Version": "2024-01-01", # Sometimes required for their internal routing
     }
 
+    # Enhanced query that includes 'status' and 'user' to verify listing quality
     query = """
     query Search($q: String, $page: Int) {
       search(q: $q, page: $page) {
@@ -77,8 +70,12 @@ def get_ouedkniss_listings():
             price
             priceUnit
             hasPrice
-            mainMedia {
-              thumbnail
+            status
+            user {
+              username
+            }
+            category {
+              name
             }
           }
         }
@@ -86,82 +83,98 @@ def get_ouedkniss_listings():
     }
     """
     
-    variables = {"q": SEARCH_KEYWORDS, "page": 1}
+    variables = {"q": "iphone", "page": 1}
     
     try:
-        print(f"🔍 Sending GraphQL request for '{SEARCH_KEYWORDS}'...")
-        response = requests.post(
-            GRAPHQL_URL, 
-            json={"query": query, "variables": variables}, 
-            headers=headers,
-            timeout=20
-        )
+        print("🔍 Searching Ouedkniss...")
+        response = requests.post(url, json={"query": query, "variables": variables}, headers=headers, timeout=15)
         
         if response.status_code != 200:
-            print(f"❌ Server returned status {response.status_code}")
+            print(f"❌ HTTP Error {response.status_code}")
             return []
 
-        data = response.json()
-        items = data.get("data", {}).get("search", {}).get("announcements", {}).get("data", [])
+        json_data = response.json()
+        
+        # Check for GraphQL specific errors inside a 200 response
+        if "errors" in json_data:
+            print(f"❌ GraphQL Error: {json_data['errors'][0]['message']}")
+            return []
+
+        items = json_data.get("data", {}).get("search", {}).get("announcements", {}).get("data", [])
         return items
+
     except Exception as e:
-        print(f"❌ Scrape Failed: {e}")
+        print(f"❌ Fatal Scrape Error: {e}")
         return []
 
-# ── AI Logic ─────────────────────────────────────────────────────────────────
+# ── AI Analyzer ──────────────────────────────────────────────────────────────
 
-def process_item(item):
-    url = f"https://www.ouedkniss.com/annonces/{item['slug']}"
+def analyze_and_save(item):
+    slug = item.get('slug')
+    title = item.get('title', 'Unknown')
+    url = f"https://www.ouedkniss.com/annonces/{slug}"
     ext_id = hashlib.md5(url.encode()).hexdigest()
     
     if is_seen(ext_id): return
 
-    title = item.get("title", "")
-    price = f"{item.get('price', '')} {item.get('priceUnit', '')}" if item.get("hasPrice") else "Prix non spécifié"
+    # Extract price context
+    price_val = item.get('price', '')
+    unit = item.get('priceUnit', '')
+    display_price = f"{price_val} {unit}" if item.get('hasPrice') else "Prix non spécifié"
     
-    print(f"🆕 New: {title} - {price}")
+    print(f"🆕 Processing: {title} | {display_price}")
 
-    prompt = f"Analyze this Ouedkniss iPhone deal: Title: '{title}', Price: '{price}'. Tasks: 1. Model? 2. Price in DZD (fix '15 million' to 150000)? 3. Is it a STEAL (20,000+ profit)? Return JSON only: {{'model': '...', 'price_dzd': 123, 'is_steal': true, 'market_dzd': 123}}"
+    prompt = f"""Analyze this Ouedkniss listing:
+    Title: {title}
+    Price: {display_price}
+    Category: {item.get('category', {}).get('name', 'N/A')}
     
-    for model in GROQ_MODELS:
-        try:
-            res = groq_client.chat.completions.create(
-                model=model, messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"}
-            )
-            ai = json.loads(res.choices[0].message.content)
-            
-            is_steal = ai.get("is_steal", False)
-            
-            if is_steal:
-                print("🔥 STEAL!")
-                send_ntfy(f"🚨 STEAL: {ai['model']}", f"Price: {ai['price_dzd']:,} DZD\nLink: {url}")
+    Tasks:
+    1. Extract actual price in DZD (e.g. 15 million = 150000).
+    2. Determine if it's a STEAL (profit margin > 20,000 DZD).
+    3. Output JSON: {{"model": "...", "price_dzd": 0, "is_steal": false}}"""
+    
+    try:
+        res = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        ai = json.loads(res.choices[0].message.content)
+        
+        if ai.get("is_steal"):
+            print("🔥 Alert: Steal detected!")
+            send_ntfy(f"🚨 DEAL: {ai.get('model')}", f"Price: {ai.get('price_dzd'):,} DZD\nLink: {url}")
 
-            supabase.table("listings").insert({
-                "external_id": ext_id, "title": title, "url": url,
-                "price": ai.get("price_dzd", 0), "is_steal": is_steal, "metadata": ai
-            }).execute()
-            mark_seen(ext_id)
-            break
-        except: continue
+        supabase.table("listings").insert({
+            "external_id": ext_id, "title": title, "url": url,
+            "price": ai.get("price_dzd", 0), "is_steal": ai.get("is_steal"), "metadata": ai
+        }).execute()
+        mark_seen(ext_id)
+    except Exception as e:
+        print(f"⚠️  AI/DB Error: {e}")
 
-# ── Server & Loop ────────────────────────────────────────────────────────────
+# ── Health & Loop ────────────────────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"Active")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ALIVE")
     def log_message(self, *args): pass
 
 def run_server():
-    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 10000))), HealthHandler).serve_forever()
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    print("🚀 SwoopDZ v4.1 GraphQL Fixed")
+    print("🚀 SwoopDZ v4.3 Live")
     
     while True:
         listings = get_ouedkniss_listings()
-        print(f"📦 Found {len(listings)} items.")
-        for l in listings: process_item(l)
-        print("😴 Sleeping 90s...")
+        print(f"📦 Fetched {len(listings)} potential deals.")
+        
+        for l in listings:
+            analyze_and_save(l)
+        
+        print("😴 Waiting 90s for next scan...")
         time.sleep(90)
