@@ -7,7 +7,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from playwright.sync_api import sync_playwright  # ← this was missing in your deployed file
+from playwright.sync_api import sync_playwright
 from groq import Groq
 
 load_dotenv()
@@ -17,13 +17,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 NTFY_TOPIC   = os.getenv("NTFY_TOPIC")
 NTFY_URL     = os.getenv("NTFY_URL", "https://ntfy.sh")
+FB_COOKIES   = os.getenv("FB_COOKIES", "")  # JSON string of cookies (see README below)
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
     print("Missing environment variables. Please check your Render Environment tab.")
     exit(1)
 
-supabase     = create_client(SUPABASE_URL, SUPABASE_KEY)
-groq_client  = Groq(api_key=GROQ_API_KEY)
+supabase    = create_client(SUPABASE_URL, SUPABASE_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
@@ -31,8 +32,6 @@ GROQ_MODELS = [
     "mixtral-8x7b-32768",
     "gemma2-9b-it",
 ]
-
-# ── Stealth JS (injected before page load) ────────────────────────────────────
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver',  { get: () => undefined });
@@ -43,38 +42,38 @@ window.chrome = { runtime: {} };
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
-def send_ntfy_notification(title: str, body: str, priority: str = "high", tags: str = "iphone,money_bag"):
+def send_ntfy_notification(title, body, priority="high", tags="iphone,money_bag"):
     try:
         requests.post(
             f"{NTFY_URL}/{NTFY_TOPIC}",
             data=body.encode("utf-8"),
             headers={"Title": title, "Priority": priority, "Tags": tags},
         ).raise_for_status()
-        print(f"ntfy sent: {title}")
+        print(f"  ntfy sent: {title}")
     except Exception as e:
-        print(f"ntfy error: {e}")
+        print(f"  ntfy error: {e}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def hash_id(url: str, title: str) -> str:
+def hash_id(url, title):
     return hashlib.md5(f"{title}_{url.split('?')[0]}".encode()).hexdigest()
 
-def is_seen(external_id: str) -> bool:
+def is_seen(external_id):
     try:
         return len(supabase.table("seen_listings").select("external_id").eq("external_id", external_id).execute().data) > 0
     except Exception as e:
-        print(f"is_seen error: {e}")
+        print(f"  is_seen error: {e}")
         return False
 
-def mark_as_seen(external_id: str):
+def mark_as_seen(external_id):
     try:
         supabase.table("seen_listings").insert({"external_id": external_id}).execute()
     except Exception as e:
-        print(f"mark_as_seen error: {e}")
+        print(f"  mark_as_seen error: {e}")
 
 # ── AI Classification ─────────────────────────────────────────────────────────
 
-def classify_listing_with_ai(title: str, raw_price: str):
+def classify_listing_with_ai(title, raw_price):
     prompt = f"""
 You are an expert in the Algerian iPhone market.
 Analyze this Facebook Marketplace listing:
@@ -87,7 +86,7 @@ Price string: "{raw_price}"
 4. Estimate current market price in DZD.
 5. is_steal = true if (market_price - listing_price) > 20000 DZD.
 
-Respond with JSON ONLY, no extra text:
+Respond with JSON ONLY:
 {{
     "model": "iPhone ...",
     "price_dzd": 150000,
@@ -106,8 +105,7 @@ Respond with JSON ONLY, no extra text:
             )
             return json.loads(result.choices[0].message.content)
         except Exception as e:
-            print(f"Groq [{model}] failed: {e} — trying next...")
-    print("All Groq models failed.")
+            print(f"  Groq [{model}] failed: {e} — trying next...")
     return None
 
 # ── Listing Processing ────────────────────────────────────────────────────────
@@ -126,7 +124,7 @@ def process_listings(listings):
             mark_as_seen(ext_id)
             continue
 
-        is_steal    = ai.get("is_steal", False)
+        is_steal     = ai.get("is_steal", False)
         parsed_price = ai.get("price_dzd", 0)
 
         if is_steal:
@@ -177,13 +175,54 @@ def scrape_facebook():
             locale="fr-DZ",
         )
         context.add_init_script(STEALTH_JS)
-        page = context.new_page()
 
-        url = "https://www.facebook.com/marketplace/algiers/search/?query=iphone"
+        # Load FB session cookies if provided
+        if FB_COOKIES:
+            try:
+                cookies = json.loads(FB_COOKIES)
+                context.add_cookies(cookies)
+                print("FB cookies loaded ✓")
+            except Exception as e:
+                print(f"Cookie parse error: {e}")
+
+        page = context.new_page()
+        url  = "https://www.facebook.com/marketplace/algiers/search/?query=iphone"
         print(f"Scraping {url} ...")
+
         try:
             page.goto(url, timeout=60000)
-            page.wait_for_selector('a[href*="/marketplace/item/"]', timeout=20000)
+            page.wait_for_load_state("domcontentloaded")
+
+            # Log page title so we know what FB is actually showing
+            print(f"Page title: {page.title()}")
+            print(f"Page URL:   {page.url}")
+
+            # Try to dismiss cookie consent banner if present
+            for selector in [
+                'button[data-cookiebanner="accept_button"]',
+                'button[title="Allow all cookies"]',
+                '[data-testid="cookie-policy-manage-dialog-accept-button"]',
+                'button:has-text("Accept All")',
+                'button:has-text("Allow")',
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=2000):
+                        btn.click()
+                        print(f"Dismissed cookie banner: {selector}")
+                        page.wait_for_timeout(1500)
+                        break
+                except Exception:
+                    pass
+
+            # Wait for listings with a generous timeout
+            try:
+                page.wait_for_selector('a[href*="/marketplace/item/"]', timeout=30000)
+            except Exception:
+                # Fallback: check what's actually on the page
+                print("Listings selector not found. Page content snippet:")
+                print(page.content()[:800])
+                return
 
             listings = []
             for link in page.query_selector_all('a[href*="/marketplace/item/"]'):
@@ -195,13 +234,15 @@ def scrape_facebook():
                 if len(lines) >= 2:
                     listings.append({"price": lines[0], "title": lines[1], "url": full_url})
 
+            print(f"Found {len(listings)} raw listings.")
             process_listings(listings)
+
         except Exception as e:
             print(f"Scrape error: {e}")
         finally:
             browser.close()
 
-# ── Health-check server (Render) ──────────────────────────────────────────────
+# ── Health-check server ───────────────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -218,7 +259,7 @@ def run_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    print("SwoopDZ Scraper v2.4 Starting...")
+    print("SwoopDZ Scraper v2.5 Starting...")
     while True:
         scrape_facebook()
         print("Sleeping 60s...")
