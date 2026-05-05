@@ -33,7 +33,7 @@ GROQ_MODELS = [
 ]
 
 # Ouedkniss iPhone search — no login required, fully public
-SCRAPE_URL = "https://www.ouedkniss.com/s?q=iphone&category=telephonie"
+SCRAPE_URL = "https://www.ouedkniss.com/s/1?keywords=iphone"
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
