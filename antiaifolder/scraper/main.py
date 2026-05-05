@@ -165,10 +165,8 @@ def process_listings(listings):
 
 def scrape_ouedkniss():
     with sync_playwright() as p:
-        # Optimized for Render's environment
         browser = p.chromium.launch(
             headless=True,
-            channel="chromium-headless-shell",
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
         context = browser.new_context(
@@ -180,64 +178,81 @@ def scrape_ouedkniss():
         print(f"Scraping {SCRAPE_URL} ...")
 
         try:
-            page.goto(SCRAPE_URL, timeout=60000)
+            page.goto(SCRAPE_URL, timeout=60000, wait_until="networkidle")
 
-            # Wait for Ouedkniss Vue framework to mount the item cards
-            page.wait_for_selector(".v-card", state="attached", timeout=30000)
-            
-            # Wait for lazy-loaded prices to populate
-            page.wait_for_load_state("networkidle", timeout=15000)
-            page.wait_for_timeout(2000)
+            # Wait for the main list container to appear
+            # Ouedkniss uses 'v-card' for many things; we want the specific item links
+            page.wait_for_selector("a[href*='/annonces/']", state="attached", timeout=30000)
+            page.wait_for_timeout(3000) # Final breathing room for lazy loaders
+
+            print(f"Page title: {page.title()}")
 
             listings = []
             seen_urls = set()
 
-            cards = page.query_selector_all(".v-card")
-            print(f"Found {len(cards)} v-card elements.")
+            # Target the links that go to the specific announcements
+            # These usually have the structure /annonces/iphone-model-name-city-id
+            links = page.query_selector_all("a[href*='/annonces/']")
+            print(f"Found {len(links)} potential listing links.")
 
-            for card in cards:
-                href = card.get_attribute("href")
-                if not href:
-                    link = card.query_selector("a")
-                    if link:
-                        href = link.get_attribute("href")
-                
-                if not href or href == "#" or len(href) < 10:
+            for link in links:
+                href = link.get_attribute("href")
+                if not href or "/annonces/" not in href:
                     continue
-                    
+                
                 full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
                 
                 if full_url in seen_urls:
                     continue
                 seen_urls.add(full_url)
 
-                text = card.inner_text().strip()
+                # Extract text from the specific card associated with this link
+                # We climb up to the closest container that holds the title and price
+                text = link.inner_text().strip()
                 if not text:
                     continue
-                    
+                
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
 
                 if len(lines) < 2:
                     continue
 
+                # On Ouedkniss, the first few lines are usually the Title, Price, and Location
                 title = lines[0]
-                price = next((l for l in lines[1:] if any(c.isdigit() for c in l)), "Prix non spécifié")
+                
+                # Find the line that looks like a price (contains numbers and isn't just a date)
+                price = "Prix non spécifié"
+                for line in lines[1:]:
+                    if any(c.isdigit() for c in line) and ("DA" in line or "مليون" in line or "دج" in line):
+                        price = line
+                        break
+                    elif any(c.isdigit() for c in line) and len(line) < 15: # Fallback for plain numbers
+                        price = line
+                        break
 
-                if len(title) > 3:
+                if len(title) > 5:
                     listings.append({"title": title, "price": price, "url": full_url})
 
-            print(f"Found {len(listings)} unique listings.")
+            # Clean up the list: Ouedkniss often repeats links for the image and the text
+            # We filter for only the most "complete" looking data
+            unique_listings = []
+            for l in listings:
+                if not any(x['url'] == l['url'] for x in unique_listings):
+                    unique_listings.append(l)
 
-            if listings:
-                process_listings(listings)
+            print(f"Found {len(unique_listings)} unique listings.")
+
+            if unique_listings:
+                process_listings(unique_listings)
             else:
-                print("No listings extracted. UI may have changed.")
+                # If we still find nothing, dump a small part of the page text to see what's there
+                print("Extraction failed. Current page text snippet:")
+                print(page.evaluate("() => document.body.innerText").strip()[:500])
 
         except Exception as e:
             print(f"Scrape error: {e}")
         finally:
             browser.close()
-
 
 # ── Health-Check Server (Render Requirement) ─────────────────────────────────
 
