@@ -8,7 +8,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync  # ✅ correct import
 from groq import Groq
 
 load_dotenv()
@@ -17,7 +16,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC")           
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 NTFY_URL = os.getenv("NTFY_URL", "https://ntfy.sh")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
@@ -34,7 +33,7 @@ GROQ_MODELS = [
     "gemma2-9b-it",
 ]
 
-# ── Notifications ────────────────────────────────────────────────────────────
+# ── Notifications ─────────────────────────────────────────────────────────────
 
 def send_ntfy_notification(title: str, body: str, priority: str = "high", tags: str = "iphone,money_bag"):
     endpoint = f"{NTFY_URL}/{NTFY_TOPIC}"
@@ -50,7 +49,7 @@ def send_ntfy_notification(title: str, body: str, priority: str = "high", tags: 
     except Exception as e:
         print(f"Error sending ntfy notification: {e}")
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def hash_id(url: str, title: str) -> str:
     combined = f"{title}_{url.split('?')[0]}"
@@ -75,7 +74,7 @@ def mark_as_seen(external_id: str):
     except Exception as e:
         print(f"Error inserting into seen_listings: {e}")
 
-# ── AI Classification (Groq) ─────────────────────────────────────────────────
+# ── AI Classification (Groq, rotating models) ─────────────────────────────────
 
 def classify_listing_with_ai(title: str, raw_price: str):
     prompt = f"""
@@ -113,7 +112,7 @@ Output JSON ONLY:
             print(f"Groq {model} failed: {e} — trying next...")
     return None
 
-# ── Listing Processing ───────────────────────────────────────────────────────
+# ── Listing Processing ────────────────────────────────────────────────────────
 
 def process_listings(listings):
     print(f"Found {len(listings)} items. Filtering duplicates...")
@@ -124,7 +123,7 @@ def process_listings(listings):
 
         print(f"Analyzing: {item['title']}")
         ai_result = classify_listing_with_ai(item["title"], item["price"])
-        
+
         if not ai_result or ai_result.get("is_fake_price"):
             mark_as_seen(ext_id)  # Don't re-check fake prices
             continue
@@ -156,14 +155,39 @@ def process_listings(listings):
         except Exception as e:
             print(f"DB Error: {e}")
 
-# ── Scraper ──────────────────────────────────────────────────────────────────
+# ── Scraper ───────────────────────────────────────────────────────────────────
+
+# Stealth via init script — masks the headless browser fingerprint without
+# needing playwright_stealth (which has an unstable API across versions).
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+Object.defineProperty(navigator, 'languages', { get: () => ['fr-DZ', 'fr', 'en-US'] });
+window.chrome = { runtime: {} };
+"""
 
 def scrape_facebook():
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="fr-DZ",
+        )
+        context.add_init_script(STEALTH_JS)
         page = context.new_page()
-        stealth_sync(page)  # ✅ plain function call, not a class method
 
         url = "https://www.facebook.com/marketplace/algiers/search/?query=iphone"
         try:
@@ -205,7 +229,7 @@ def run_dummy_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    print("SwoopDZ Scraper v2.2 Starting...")
+    print("SwoopDZ Scraper v2.3 Starting...")
     while True:
         scrape_facebook()
         time.sleep(60)
