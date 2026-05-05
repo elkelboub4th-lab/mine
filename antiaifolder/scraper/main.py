@@ -169,80 +169,70 @@ def scrape_ouedkniss():
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
-        # Use a realistic User-Agent to match a standard browser session
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 900},
-            locale="fr-DZ",
         )
         page = context.new_page()
+        
+        # Inject stealth to avoid bot detection
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
         print(f"Scraping {SCRAPE_URL} ...")
 
         try:
-            # wait_until="networkidle" is crucial for Vue-based sites like Ouedkniss
-            page.goto(SCRAPE_URL, timeout=60000, wait_until="networkidle")
-
-            # Updated selector: Target the actual announcement links
-            # Ouedkniss listings are typically inside <a> tags pointing to '/annonces/'
-            page.wait_for_selector("a[href*='/annonces/']", state="attached", timeout=30000)
-            page.wait_for_timeout(3000) # Breathing room for dynamic content
+            # Use 'domcontentloaded' first, then wait for the dynamic content
+            page.goto(SCRAPE_URL, timeout=90000, wait_until="domcontentloaded")
+            
+            # Wait for the main content area to appear (more reliable than specific links)
+            # Ouedkniss uses a main layout container
+            page.wait_for_selector("main", timeout=30000)
+            
+            # Additional wait for Vue/Nuxt to hydrate and render items
+            page.wait_for_timeout(5000)
 
             listings = []
             seen_urls = set()
 
-            # Find all announcement links which represent individual cards
-            links = page.query_selector_all("a[href*='/annonces/']")
-            print(f"Found {len(links)} potential listing links.")
-
-            for link in links:
+            # The current structure uses 'v-card' and links containing '/annonces/'
+            # We search for all links and then filter in Python for better reliability
+            potential_links = page.query_selector_all("a")
+            
+            for link in potential_links:
                 href = link.get_attribute("href")
                 if not href or "/annonces/" not in href:
                     continue
                 
                 full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
-                
                 if full_url in seen_urls:
                     continue
                 seen_urls.add(full_url)
 
-                # Extract the visible text from the card
+                # Extract text using a more robust approach
                 text = link.inner_text().strip()
                 if not text:
                     continue
                 
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-                # Typical Ouedkniss card structure in the text:
-                # Line 0: Model/Title
-                # Line 1+: Price or Location
+                
                 if len(lines) >= 2:
+                    # In current Ouedkniss cards, the first line is usually the title
                     title = lines[0]
-                    
-                    # Logic to identify the price line (look for currency or digits)
+                    # Search through lines for anything resembling a price (DA, digits, etc)
                     price = "Prix non spécifié"
-                    for line in lines[1:]:
-                        if any(c.isdigit() for c in line) and ("DA" in line or "مليون" in line or "دج" in line):
+                    for line in lines:
+                        if any(char.isdigit() for char in line) and ("DA" in line or "دج" in line):
                             price = line
                             break
-                        elif any(c.isdigit() for c in line) and len(line) < 15:
-                            price = line
-                            break
-
+                    
                     if len(title) > 5:
                         listings.append({"title": title, "price": price, "url": full_url})
 
-            unique_listings = []
-            for l in listings:
-                if not any(x['url'] == l['url'] for x in unique_listings):
-                    unique_listings.append(l)
-
-            print(f"Found {len(unique_listings)} unique listings.")
-
-            if unique_listings:
-                process_listings(unique_listings)
+            print(f"Found {len(listings)} listings.")
+            if listings:
+                process_listings(listings)
             else:
-                # If zero, print current state for debugging
-                print("Extraction failed. Check if selectors 'a[href*=\"/annonces/\"]' are still valid.")
+                print("No listings found. The page might be empty or blocked.")
 
         except Exception as e:
             print(f"Scrape error: {e}")
