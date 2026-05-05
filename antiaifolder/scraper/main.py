@@ -7,7 +7,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from playwright.sync_api import sync_playwright
+#from playwright.sync_api import sync_playwright
 from groq import Groq
 
 load_dotenv()
