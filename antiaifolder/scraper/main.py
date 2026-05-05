@@ -7,18 +7,18 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from playwright.sync_api import sync_playwright
 from groq import Groq
+from typing import List, Dict, Optional, Any
+from datetime import datetime
 
 load_dotenv()
 
 # ── Configuration & Initialization ───────────────────────────────────────────
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-NTFY_TOPIC   = os.getenv("NTFY_TOPIC")
-NTFY_URL     = os.getenv("NTFY_URL", "https://ntfy.sh")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
+NTFY_URL = os.getenv("NTFY_URL", "https://ntfy.sh")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
     print("Missing environment variables. Please check your Render Environment tab.")
@@ -34,12 +34,21 @@ GROQ_MODELS = [
     "gemma2-9b-it",
 ]
 
-# The target URL for iPhones on Ouedkniss
-SCRAPE_URL = "https://www.ouedkniss.com/s/1?keywords=iphone"
+# GraphQL API Configuration
+GRAPHQL_URL = "https://api.ouedkniss.com/graphql"
+GRAPHQL_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Origin": "https://www.ouedkniss.com",
+    "Referer": "https://www.ouedkniss.com/",
+}
 
+# Search configuration
+SEARCH_KEYWORDS = "iphone"
+MAX_PAGES = 3  # How many pages to scrape per cycle
+ITEMS_PER_PAGE = 20
 
-# ── Notifications ────────────────────────────────────────────────────────────
-
+# ── Notifications ───────────────────────────────────────────────────────────
 def send_ntfy_notification(title: str, body: str, priority: str = "high", tags: str = "iphone,money_bag"):
     endpoint = f"{NTFY_URL}/{NTFY_TOPIC}"
     headers = {
@@ -50,13 +59,11 @@ def send_ntfy_notification(title: str, body: str, priority: str = "high", tags: 
     try:
         response = requests.post(endpoint, data=body.encode("utf-8"), headers=headers)
         response.raise_for_status()
-        print(f"ntfy notification sent to {endpoint}")
+        print(f"✅ Ntfy notification sent: {title}")
     except Exception as e:
-        print(f"Error sending ntfy notification: {e}")
-
+        print(f"❌ Error sending ntfy notification: {e}")
 
 # ── Database Helpers ─────────────────────────────────────────────────────────
-
 def hash_id(url: str, title: str) -> str:
     combined = f"{title}_{url.split('?')[0]}"
     return hashlib.md5(combined.encode()).hexdigest()
@@ -71,19 +78,17 @@ def is_seen(external_id: str) -> bool:
         )
         return len(response.data) > 0
     except Exception as e:
-        print(f"Error checking seen_listings: {e}")
+        print(f"❌ Error checking seen_listings: {e}")
         return False
 
 def mark_as_seen(external_id: str):
     try:
         supabase.table("seen_listings").insert({"external_id": external_id}).execute()
     except Exception as e:
-        print(f"Error inserting into seen_listings: {e}")
-
+        print(f"❌ Error inserting into seen_listings: {e}")
 
 # ── AI Classification (Groq) ─────────────────────────────────────────────────
-
-def classify_listing_with_ai(title: str, raw_price: str):
+def classify_listing_with_ai(title: str, raw_price: str) -> Optional[Dict[str, Any]]:
     prompt = f"""
 You are an expert in the Algerian iPhone market.
 Analyze this Ouedkniss listing:
@@ -91,18 +96,20 @@ Title: "{title}"
 Price as string: "{raw_price}"
 
 Tasks:
-1. Determine the iPhone model.
-2. Extract actual price in DZD (Handle '15 million' as 150000, or '1 DA' as fake).
-3. Identify fake prices (e.g., 1, 1111, 1234, or 'Prix non spécifié').
-4. Estimate market price for this specific model in DZD.
-5. Determine if it is a STEAL (Margin > 20,000 DZD).
+1. Determine the iPhone model (e.g., "iPhone 13 Pro Max", "iPhone 11"). If unknown, use "Unknown".
+2. Extract actual price in DZD. Handle formats like "150 000", "150k", "150.000 DA", "150000 دج".
+   - "15 million" = 15000000 (likely fake for phones)
+   - "1 DA" or "1 دج" = fake
+3. Identify fake prices: 1, 1111, 1234, 999999999, or "Prix non spécifié".
+4. Estimate realistic market price for this specific model in DZD (2024 prices).
+5. Determine if it is a STEAL: (market_price - listing_price) > 20000 DZD.
 
-Output JSON ONLY (no markdown blocks, no extra text):
+Output JSON ONLY (no markdown, no extra text):
 {{
-    "model": "iPhone ...",
-    "price_dzd": 150000,
+    "model": "iPhone 13 Pro",
+    "price_dzd": 85000,
     "is_fake_price": false,
-    "estimated_market_price_dzd": 180000,
+    "estimated_market_price_dzd": 110000,
     "is_steal": true
 }}
 """
@@ -114,235 +121,364 @@ Output JSON ONLY (no markdown blocks, no extra text):
                 response_format={"type": "json_object"},
                 temperature=0.2,
             )
-            return json.loads(completion.choices[0].message.content)
+            result = json.loads(completion.choices[0].message.content)
+            # Validate required fields
+            if all(k in result for k in ["model", "price_dzd", "is_fake_price", "estimated_market_price_dzd", "is_steal"]):
+                return result
         except Exception as e:
-            print(f"Groq {model} failed, trying next...")
+            print(f"⚠️  Groq {model} failed: {e}")
+            continue
     return None
 
+# ── GraphQL Scraper Core ─────────────────────────────────────────────────────
+def execute_graphql_query(query: str, variables: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Execute a GraphQL query and return the response"""
+    payload = {
+        "query": query,
+        "variables": variables
+    }
+    
+    try:
+        response = requests.post(
+            GRAPHQL_URL,
+            json=payload,
+            headers=GRAPHQL_HEADERS,
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        if "errors" in data:
+            print(f"❌ GraphQL errors: {data['errors']}")
+            return None
+        
+        return data.get("data")
+    
+    except requests.exceptions.RequestException as e:
+        print(f"❌ GraphQL request failed: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"❌ Failed to parse GraphQL response: {e}")
+        return None
+
+def search_announcements(keywords: str = "iphone", page: int = 1, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Search Ouedkniss announcements using GraphQL API
+    Returns list of announcement objects
+    """
+    
+    query = """
+    query SearchAnnouncements($filter: AnnouncementFilterInput!) {
+        announcements: announcementSearch(filter: $filter) {
+            data {
+                id
+                title
+                price
+                currency
+                description
+                url
+                createdAt
+                updatedAt
+                images {
+                    id
+                    url
+                    thumbnail
+                }
+                location {
+                    city {
+                        id
+                        name
+                        slug
+                    }
+                    region {
+                        id
+                        name
+                        slug
+                    }
+                }
+                category {
+                    id
+                    name
+                    slug
+                }
+                user {
+                    id
+                    name
+                    type
+                }
+                attributes {
+                    key
+                    value
+                }
+            }
+            paginatorInfo {
+                currentPage
+                lastPage
+                total
+                count
+            }
+        }
+    }
+    """
+    
+    variables = {
+        "filter": {
+            "keywords": keywords,
+            "pagination": {
+                "page": page,
+                "limit": limit
+            },
+            "sort": [
+                {"field": "createdAt", "order": "DESC"}
+            ]
+        }
+    }
+    
+    data = execute_graphql_query(query, variables)
+    
+    if not data:
+        return []
+    
+    announcements = data.get("announcements", {})
+    items = announcements.get("data", [])
+    paginator = announcements.get("paginatorInfo", {})
+    
+    print(f"📊 Page {page}/{paginator.get('lastPage', '?')} - Found {len(items)} items (Total: {paginator.get('total', '?')})")
+    
+    return items
+
+def transform_announcement_to_listing(announcement: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Transform GraphQL announcement to scraper listing format"""
+    try:
+        title = announcement.get("title", "")
+        price = announcement.get("price", 0)
+        currency = announcement.get("currency", "DA")
+        url_path = announcement.get("url", "")
+        
+        # Build full URL
+        if url_path.startswith("/"):
+            full_url = f"https://www.ouedkniss.com{url_path}"
+        elif url_path.startswith("http"):
+            full_url = url_path
+        else:
+            full_url = f"https://www.ouedkniss.com/annonces/{announcement.get('id', '')}"
+        
+        # Format price string
+        if price and price > 0:
+            price_str = f"{price:,} {currency}"
+        else:
+            price_str = "Prix non spécifié"
+        
+        # Get location
+        location = announcement.get("location", {})
+        city = location.get("city", {}).get("name", "")
+        region = location.get("region", {}).get("name", "")
+        location_str = f"{city}, {region}" if city and region else city or region or "Non spécifié"
+        
+        # Get images
+        images = announcement.get("images", [])
+        image_urls = [img.get("url") or img.get("thumbnail") for img in images if img.get("url") or img.get("thumbnail")]
+        
+        # Get category
+        category = announcement.get("category", {}).get("name", "Unknown")
+        
+        # Get user info
+        user = announcement.get("user", {})
+        seller_name = user.get("name", "Anonyme")
+        seller_type = user.get("type", "individual")
+        
+        # Get creation date
+        created_at = announcement.get("createdAt", "")
+        
+        return {
+            "title": title,
+            "price": price_str,
+            "price_numeric": price if price and price > 0 else 0,
+            "url": full_url,
+            "location": location_str,
+            "city": city,
+            "images": image_urls,
+            "category": category,
+            "seller": seller_name,
+            "seller_type": seller_type,
+            "created_at": created_at,
+            "description": announcement.get("description", "")[:500],  # First 500 chars
+            "raw_announcement": announcement  # Keep full data for debugging
+        }
+    
+    except Exception as e:
+        print(f"⚠️  Error transforming announcement: {e}")
+        return None
+
+def scrape_ouedkniss_graphql() -> List[Dict[str, Any]]:
+    """
+    Main GraphQL scraper function
+    Scrapes multiple pages and returns all valid listings
+    """
+    print(f"🔍 Starting GraphQL scrape for '{SEARCH_KEYWORDS}'...")
+    
+    all_listings = []
+    
+    for page in range(1, MAX_PAGES + 1):
+        print(f"\n📄 Scraping page {page}...")
+        
+        try:
+            announcements = search_announcements(
+                keywords=SEARCH_KEYWORDS,
+                page=page,
+                limit=ITEMS_PER_PAGE
+            )
+            
+            if not announcements:
+                print(f"⚠️  No announcements found on page {page}")
+                break
+            
+            for announcement in announcements:
+                listing = transform_announcement_to_listing(announcement)
+                if listing:
+                    # Filter for iPhones (case-insensitive)
+                    if SEARCH_KEYWORDS.lower() in listing["title"].lower():
+                        all_listings.append(listing)
+            
+            # Respectful delay between pages
+            if page < MAX_PAGES:
+                time.sleep(2)
+        
+        except Exception as e:
+            print(f"❌ Error on page {page}: {e}")
+            break
+    
+    print(f"\n✅ Total listings found: {len(all_listings)}")
+    return all_listings
 
 # ── Listing Processing ───────────────────────────────────────────────────────
-
-def process_listings(listings):
-    print(f"Found {len(listings)} raw items. Processing...")
+def process_listings(listings: List[Dict[str, Any]]):
+    print(f"\n🤖 Processing {len(listings)} listings through AI...")
     
-    for item in listings:
+    processed_count = 0
+    steal_count = 0
+    
+    for i, item in enumerate(listings, 1):
+        print(f"\n[{i}/{len(listings)}] Analyzing: {item['title'][:60]}...")
+        
         ext_id = hash_id(item["url"], item["title"])
+        
         if is_seen(ext_id):
+            print("  ⏭️  Already seen, skipping")
             continue
-
-        print(f"Analyzing: {item['title']} - {item['price']}")
+        
+        # AI Classification
         ai_result = classify_listing_with_ai(item["title"], item["price"])
         
-        if not ai_result or ai_result.get("is_fake_price"):
-            mark_as_seen(ext_id) # Skip and don't process fake prices again
+        if not ai_result:
+            print("  ⚠️  AI classification failed, skipping")
+            mark_as_seen(ext_id)
             continue
-
+        
+        if ai_result.get("is_fake_price"):
+            print(f"  🚫 Fake price detected: {item['price']}")
+            mark_as_seen(ext_id)
+            continue
+        
         is_steal = ai_result.get("is_steal", False)
         parsed_price = ai_result.get("price_dzd", 0)
-
+        
+        # Prepare database record
+        db_record = {
+            "external_id": ext_id,
+            "title": item["title"],
+            "price": parsed_price,
+            "url": item["url"],
+            "category": ai_result.get("model", "Unknown"),
+            "is_steal": is_steal,
+            "location": item.get("location", ""),
+            "city": item.get("city", ""),
+            "seller": item.get("seller", ""),
+            "images": item.get("images", []),
+            "metadata": ai_result,
+            "scraped_at": datetime.utcnow().isoformat()
+        }
+        
+        # Send notification if steal
         if is_steal:
-            print("🔥 STEAL DETECTED 🔥")
+            steal_count += 1
+            print("  🔥🔥 STEAL DETECTED! 🔥🔥🔥")
+            
             notif_title = f"🚨 STEAL: {ai_result.get('model')}"
-            notif_body = f"Price: {parsed_price:,} DZD\nMarket: {ai_result.get('estimated_market_price_dzd'):,} DZD\nLink: {item['url']}"
+            notif_body = (
+                f"💰 Price: {parsed_price:,} DZD\n"
+                f"📊 Market: {ai_result.get('estimated_market_price_dzd'):,} DZD\n"
+                f"📍 Location: {item.get('location', 'N/A')}\n"
+                f"👤 Seller: {item.get('seller', 'N/A')}\n"
+                f"🔗 Link: {item['url']}"
+            )
+            
             send_ntfy_notification(title=notif_title, body=notif_body)
-
+        
+        # Save to database
         try:
-            supabase.table("listings").insert({
-                "external_id": ext_id,
-                "title": item["title"],
-                "price": parsed_price,
-                "url": item["url"],
-                "category": ai_result.get("model", "Unknown"),
-                "is_steal": is_steal,
-                "metadata": ai_result,
-            }).execute()
+            supabase.table("listings").insert(db_record).execute()
             mark_as_seen(ext_id)
+            processed_count += 1
+            print(f"  ✅ Saved to database")
+        
         except Exception as e:
-            print(f"DB Error: {e}")
+            print(f"  ❌ DB Error: {e}")
+    
+    print(f"\n📈 Summary: Processed {processed_count} listings, Found {steal_count} steals")
 
+# ── Health-Check Server (Render Requirement) ─────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"SwoopDZ Active - GraphQL Scraper")
+    
+    def log_message(self, *args):
+        pass  # Silence access logs
 
-# ── Scraper Core ─────────────────────────────────────────────────────────────
+def run_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"🏥 Health server running on port {port}")
+    server.serve_forever()
 
-def scrape_ouedkniss():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900},
-            locale="fr-DZ",
-            timezone_id="Africa/Algiers",
-            extra_http_headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "fr-DZ,fr;q=0.9,en;q=0.8",
-                "Connection": "keep-alive",
-            },
-        )
-        page = context.new_page()
-        
-        # Stealth scripts
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['fr-DZ', 'fr', 'en']});
-        """)
-        
-        # Log requests for debugging
-        page.on("response", lambda r: print(f"  📡 {r.status} {r.url.split('?')[0][-60:]}") 
-                if "ouedkniss" in r.url and r.status >= 400 else None)
-        
-        print(f"🔍 Scraping {SCRAPE_URL} ...")
-        
+# ── Entry Point ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # Start the health server in background
+    threading.Thread(target=run_server, daemon=True).start()
+    
+    print("=" * 70)
+    print("🚀 SwoopDZ Scraper v4.0 — Ouedkniss GraphQL Edition")
+    print("=" * 70)
+    print(f" Keywords: {SEARCH_KEYWORDS}")
+    print(f"📄 Pages per cycle: {MAX_PAGES}")
+    print(f"📦 Items per page: {ITEMS_PER_PAGE}")
+    print(f"🗄️  Supabase: {'✅' if supabase else '❌'}")
+    print(f"🤖 Groq AI: {'✅' if groq_client else '❌'}")
+    print(f"🔔 Ntfy: {'✅' if NTFY_TOPIC else '❌'}")
+    print("=" * 70)
+    
+    while True:
         try:
-            # Go to page and wait for initial load
-            page.goto(SCRAPE_URL, wait_until="domcontentloaded", timeout=60000)
+            start_time = time.time()
             
-            # Handle cookie consent if present
-            try:
-                for btn_sel in ["button.cp-accept", "#onetrust-accept-btn-handler", "button[data-cookie-accept]"]:
-                    btn = page.query_selector(btn_sel)
-                    if btn and btn.is_visible():
-                        print("  🍪 Accepting cookies...")
-                        btn.click()
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                        break
-            except:
-                pass  # No cookie banner or already accepted
-            
-            # ✅ CRITICAL: Wait for Vue to hydrate listings
-            # Ouedkniss uses <article class="o-announ-card"> or <div class="v-card">
-            card_selectors = [
-                "article.o-announ-card",
-                ".o-announ-card", 
-                ".v-card.annonce-card",
-                "[data-testid='annonce-card']",
-                "article.annonce"
-            ]
-            
-            card_found = False
-            for selector in card_selectors:
-                try:
-                    page.wait_for_selector(selector, state="attached", timeout=12000)
-                    print(f"  ✓ Cards found with: {selector}")
-                    card_found = True
-                    break
-                except:
-                    continue
-            
-            if not card_found:
-                print("  ❌ No listing cards found — page may be blocked or empty")
-                _debug_dump(page, "no_cards")
-                browser.close()
-                return
-            
-            # Wait for network to settle + Vue hydration
-            page.wait_for_load_state("networkidle", timeout=15000)
-            page.wait_for_timeout(2500)  # Extra buffer for lazy-loaded prices
-            
-            # ✅ Extract listings with robust selectors
-            listings = []
-            seen_urls = set()
-            
-            # Get all cards first, then extract data from each
-            cards = page.query_selector_all("article.o-announ-card, .o-announ-card, .v-card.annonce-card")
-            print(f"  📦 Found {len(cards)} card elements")
-            
-            for card in cards:
-                try:
-                    # Extract link
-                    link_el = card.query_selector("a[href]")
-                    if not link_el:
-                        continue
-                    href = link_el.get_attribute("href") or ""
-                    
-                    # Normalize URL
-                    if href.startswith("/"):
-                        full_url = f"https://www.ouedkniss.com{href}"
-                    elif href.startswith("http"):
-                        full_url = href
-                    else:
-                        continue
-                    
-                    # Validate it's an annonce page
-                    if "/annonces/" not in full_url or (".htm" not in full_url and ".html" not in full_url):
-                        continue
-                    if full_url in seen_urls:
-                        continue
-                    seen_urls.add(full_url)
-                    
-                    # Extract title & price with CSS selectors FIRST
-                    title_el = card.query_selector("h3, .o-announ-card-title, .card-title, .titre_annonce")
-                    price_el = card.query_selector("span.price, .prix, .o-announ-card-price, .card-price, .montant")
-                    
-                    title = title_el.inner_text().strip() if title_el else ""
-                    price = price_el.inner_text().strip() if price_el else ""
-                    
-                    # Fallback: parse from innerText if selectors fail
-                    if not title or len(title) < 4:
-                        text = card.inner_text().strip()
-                        lines = [l.strip() for l in text.split("\n") if l.strip() and len(l.strip()) > 3]
-                        if lines:
-                            title = lines[0]
-                            # Find price: line with digits + DA/dj/دج
-                            for line in lines[1:5]:
-                                if any(c.isdigit() for c in line) and any(k in line.lower() for k in ["da", "دج", "dj", "000", " k", "k "]):
-                                    price = line
-                                    break
-                    
-                    # Only keep if title looks valid
-                    if title and len(title) > 5 and "iphone" in title.lower():
-                        listings.append({
-                            "title": title,
-                            "price": price if price else "Prix non spécifié",
-                            "url": full_url
-                        })
-                        
-                except Exception as e:
-                    print(f"  ⚠ Error parsing card: {e}")
-                    continue
-            
-            print(f"✅ Extracted {len(listings)} valid iPhone listings")
+            # Scrape using GraphQL
+            listings = scrape_ouedkniss_graphql()
             
             if listings:
                 process_listings(listings)
             else:
-                print("  ⚠ No valid listings after filtering — dumping debug HTML")
-                _debug_dump(page, "no_valid_listings")
-                
+                print("⚠️  No listings found in this cycle")
+            
+            elapsed = time.time() - start_time
+            print(f"\n⏱️  Cycle completed in {elapsed:.2f} seconds")
+            
         except Exception as e:
-            print(f"❌ Scrape error: {e}")
+            print(f"❌ Critical error in main loop: {e}")
             import traceback
             traceback.print_exc()
-            _debug_dump(page, "scrape_error")
-        finally:
-            browser.close()
-
-# ── Health-Check Server (Render Requirement) ─────────────────────────────────
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"SwoopDZ Active")
-    def log_message(self, *args):
-        pass # Silence access logs to keep terminal clean
-
-def run_server():
-    port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-
-
-# ── Entry Point ──────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    # Start the dummy server in the background so Render doesn't kill the app
-    threading.Thread(target=run_server, daemon=True).start()
-    
-    print("SwoopDZ Scraper v3.2 — Ouedkniss Edition Starting...")
-    
-    while True:
-        scrape_ouedkniss()
-        print("Sleeping 60s...")
-        time.sleep(60)
+        
+        print(f"\n😴 Sleeping 90 seconds before next cycle...")
+        time.sleep(90)
