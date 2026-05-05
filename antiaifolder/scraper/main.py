@@ -186,7 +186,7 @@ def scrape_facebook():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, channel="chromium-headless-shell")
         page = browser.new_page()
-        stealth_sync(page)
+        stealth(page)
 
         url = "https://www.facebook.com/marketplace/algiers/search/?query=iphone"
         print(f"Scraping {url}...")
