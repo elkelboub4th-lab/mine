@@ -17,7 +17,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 NTFY_TOPIC   = os.getenv("NTFY_TOPIC")
 NTFY_URL     = os.getenv("NTFY_URL", "https://ntfy.sh")
-FB_COOKIES   = os.getenv("FB_COOKIES", "")  # JSON string of cookies (see README below)
+FB_COOKIES   = os.getenv("FB_COOKIES", "")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
     print("Missing environment variables. Please check your Render Environment tab.")
@@ -39,6 +39,36 @@ Object.defineProperty(navigator, 'plugins',    { get: () => [1, 2, 3] });
 Object.defineProperty(navigator, 'languages',  { get: () => ['fr-DZ', 'fr', 'en-US'] });
 window.chrome = { runtime: {} };
 """
+
+# ── Cookie format converter ───────────────────────────────────────────────────
+# Cookie-Editor exports a slightly different format than Playwright expects.
+# This converts it automatically so you can paste the raw export into FB_COOKIES.
+
+SAMESITE_MAP = {
+    "no_restriction": "None",
+    "lax":            "Lax",
+    "strict":         "Strict",
+    "unspecified":    "None",
+    None:             "None",
+}
+
+def convert_cookies(raw_cookies: list) -> list:
+    converted = []
+    for c in raw_cookies:
+        cookie = {
+            "name":     c["name"],
+            "value":    c["value"],
+            "domain":   c["domain"],
+            "path":     c.get("path", "/"),
+            "secure":   c.get("secure", False),
+            "httpOnly": c.get("httpOnly", False),
+            "sameSite": SAMESITE_MAP.get(c.get("sameSite"), "None"),
+        }
+        # expirationDate (float) → expires (int); skip if session cookie
+        if c.get("expirationDate"):
+            cookie["expires"] = int(c["expirationDate"])
+        converted.append(cookie)
+    return converted
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
@@ -176,14 +206,17 @@ def scrape_facebook():
         )
         context.add_init_script(STEALTH_JS)
 
-        # Load FB session cookies if provided
+        # Load and convert FB cookies
         if FB_COOKIES:
             try:
-                cookies = json.loads(FB_COOKIES)
-                context.add_cookies(cookies)
-                print("FB cookies loaded ✓")
+                raw  = json.loads(FB_COOKIES)
+                converted = convert_cookies(raw)
+                context.add_cookies(converted)
+                print(f"FB cookies loaded ✓ ({len(converted)} cookies)")
             except Exception as e:
-                print(f"Cookie parse error: {e}")
+                print(f"Cookie error: {e}")
+        else:
+            print("⚠️  No FB_COOKIES set — will likely hit login wall.")
 
         page = context.new_page()
         url  = "https://www.facebook.com/marketplace/algiers/search/?query=iphone"
@@ -193,35 +226,38 @@ def scrape_facebook():
             page.goto(url, timeout=60000)
             page.wait_for_load_state("domcontentloaded")
 
-            # Log page title so we know what FB is actually showing
             print(f"Page title: {page.title()}")
             print(f"Page URL:   {page.url}")
 
-            # Try to dismiss cookie consent banner if present
+            # Bail early if redirected to login
+            if "/login" in page.url:
+                print("❌ Redirected to login — cookies may be expired. Re-export and update FB_COOKIES.")
+                return
+
+            # Try to dismiss cookie consent banner
             for selector in [
                 'button[data-cookiebanner="accept_button"]',
                 'button[title="Allow all cookies"]',
-                '[data-testid="cookie-policy-manage-dialog-accept-button"]',
                 'button:has-text("Accept All")',
                 'button:has-text("Allow")',
+                'button:has-text("Tout accepter")',
             ]:
                 try:
                     btn = page.locator(selector).first
                     if btn.is_visible(timeout=2000):
                         btn.click()
-                        print(f"Dismissed cookie banner: {selector}")
+                        print(f"Dismissed cookie banner ({selector})")
                         page.wait_for_timeout(1500)
                         break
                 except Exception:
                     pass
 
-            # Wait for listings with a generous timeout
+            # Wait for listings
             try:
                 page.wait_for_selector('a[href*="/marketplace/item/"]', timeout=30000)
             except Exception:
-                # Fallback: check what's actually on the page
-                print("Listings selector not found. Page content snippet:")
-                print(page.content()[:800])
+                print("❌ No listings found. Page snippet:")
+                print(page.content()[:500])
                 return
 
             listings = []
@@ -259,7 +295,7 @@ def run_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    print("SwoopDZ Scraper v2.5 Starting...")
+    print("SwoopDZ Scraper v2.6 Starting...")
     while True:
         scrape_facebook()
         print("Sleeping 60s...")
