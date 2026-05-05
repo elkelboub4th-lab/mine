@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth  # Fixed import
+from playwright_stealth import stealth_sync  # ✅ correct import
 from groq import Groq
 
 load_dotenv()
@@ -75,7 +75,7 @@ def mark_as_seen(external_id: str):
     except Exception as e:
         print(f"Error inserting into seen_listings: {e}")
 
-# ── AI Classification (Groq) ────────────────────────────────
+# ── AI Classification (Groq) ─────────────────────────────────────────────────
 
 def classify_listing_with_ai(title: str, raw_price: str):
     prompt = f"""
@@ -110,7 +110,7 @@ Output JSON ONLY:
             )
             return json.loads(completion.choices[0].message.content)
         except Exception as e:
-            print(f"Groq {model} failed, trying next...")
+            print(f"Groq {model} failed: {e} — trying next...")
     return None
 
 # ── Listing Processing ───────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ def process_listings(listings):
         ai_result = classify_listing_with_ai(item["title"], item["price"])
         
         if not ai_result or ai_result.get("is_fake_price"):
-            mark_as_seen(ext_id) # Don't check fake prices again
+            mark_as_seen(ext_id)  # Don't re-check fake prices
             continue
 
         is_steal = ai_result.get("is_steal", False)
@@ -135,7 +135,11 @@ def process_listings(listings):
         if is_steal:
             print("🔥 STEAL DETECTED 🔥")
             notif_title = f"🚨 STEAL: {ai_result.get('model')}"
-            notif_body = f"Price: {parsed_price:,} DZD\nMarket: {ai_result.get('estimated_market_price_dzd'):,} DZD\nLink: {item['url']}"
+            notif_body = (
+                f"Price: {parsed_price:,} DZD\n"
+                f"Market: {ai_result.get('estimated_market_price_dzd'):,} DZD\n"
+                f"Link: {item['url']}"
+            )
             send_ntfy_notification(title=notif_title, body=notif_body)
 
         try:
@@ -156,12 +160,10 @@ def process_listings(listings):
 
 def scrape_facebook():
     with sync_playwright() as p:
-        # Optimized for Render with the correct Stealth wrapper
-        stealth_obj = Stealth()
-        browser = p.chromium.launch(headless=True, channel="chromium-headless-shell")
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
-        stealth_obj.apply_sync(page) # Fixed stealth call
+        stealth_sync(page)  # ✅ plain function call, not a class method
 
         url = "https://www.facebook.com/marketplace/algiers/search/?query=iphone"
         try:
@@ -172,7 +174,8 @@ def scrape_facebook():
             links = page.query_selector_all('a[href*="/marketplace/item/"]')
             for link in links:
                 href = link.get_attribute("href")
-                if not href: continue
+                if not href:
+                    continue
                 full_url = f"https://www.facebook.com{href}" if href.startswith("/") else href
                 text_content = link.inner_text()
                 if text_content:
@@ -186,14 +189,15 @@ def scrape_facebook():
         finally:
             browser.close()
 
-# ── Server & Loop ──────────────────────────────────────────────────────────
+# ── Server & Loop ─────────────────────────────────────────────────────────────
 
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"SwoopDZ Active")
-    def log_message(self, format, *args): pass
+    def log_message(self, format, *args):
+        pass
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -201,7 +205,7 @@ def run_dummy_server():
 
 if __name__ == "__main__":
     threading.Thread(target=run_dummy_server, daemon=True).start()
-    print("SwoopDZ Scraper v2.1 Starting...")
+    print("SwoopDZ Scraper v2.2 Starting...")
     while True:
         scrape_facebook()
         time.sleep(60)
