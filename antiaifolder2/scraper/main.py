@@ -4,6 +4,7 @@ import time
 import re
 import hashlib
 import json
+import random
 import requests
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -24,7 +25,7 @@ from groq import Groq
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-NTFY_TOPIC   = os.getenv("NTFY_TOPIC")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 
 if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
     print("❌ Missing env vars! Check your .env file.", flush=True)
@@ -37,7 +38,6 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 
 def send_ntfy(title, body):
     try:
-        # HTTP headers are latin-1, so strip emoji from title; put emoji in body
         safe_title = title.encode("ascii", errors="ignore").decode("ascii").strip()
         if not safe_title:
             safe_title = "SwoopDZ Deal Alert"
@@ -63,37 +63,62 @@ def is_seen(ext_id: str) -> bool:
         print(f"⚠️  Supabase seen check error: {e}", flush=True)
         return False
 
+# ── Debug helpers (Render-safe: log to stdout instead of files) ───────────────
+
+def log_debug_html(page, label: str):
+    """Dump page HTML + title to stdout so it appears in Render logs."""
+    try:
+        title = page.title()
+        html  = page.evaluate("() => document.body.innerHTML.slice(0, 4000)")
+        print(f"\n🐛 DEBUG [{label}] title='{title}'", flush=True)
+        print(f"🐛 DEBUG [{label}] body_html_head:\n{html[:2000]}", flush=True)
+    except Exception as e:
+        print(f"⚠️  log_debug_html error: {e}", flush=True)
+
 # ── Native Stealth Scraper ────────────────────────────────────────────────────
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
 def get_listings_stealth(page_num: int = 1):
-    # ouedkniss search URL — page param is 0-indexed on the API but site uses page= query param
-    url = f"https://www.ouedkniss.com/recherche?q=iphone&page={page_num}"
-    print(f"🌐 Launching browser for page {page_num}...", flush=True)
+    url = f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone"
+    print(f"🌐 Launching browser for page {page_num}: {url}", flush=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+            ]
         )
-        import random
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ]
         context = browser.new_context(
-            user_agent=random.choice(user_agents),
+            user_agent=random.choice(USER_AGENTS),
             locale="fr-DZ",
             timezone_id="Africa/Algiers",
-            viewport={"width": 1280, "height": 900}
+            viewport={"width": 1280, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "fr-DZ,fr;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            }
         )
         page = context.new_page()
 
-        # Log all failing requests or GraphQL requests to debug Render API blocks
-        page.on("response", lambda r: print(f"🔍 Network: {r.status} {r.url}", flush=True) if "graphql" in r.url or r.status >= 400 else None)
+        def on_response(r):
+            if "graphql" in r.url:
+                print(f"🔍 GraphQL {r.status}: {r.url}", flush=True)
+            elif r.status >= 400:
+                print(f"⚠️  HTTP {r.status}: {r.url}", flush=True)
+        page.on("response", on_response)
 
         try:
-            # Inject opts object expected by stealth.js to avoid ReferenceError
             opts_script = """
             const opts = {
                 script_logging: false,
@@ -109,49 +134,48 @@ def get_listings_stealth(page_num: int = 1):
             if os.path.exists(stealth_path):
                 with open(stealth_path, "r", encoding="utf-8") as f:
                     page.add_init_script(opts_script + f.read())
+                print("✅ stealth.js loaded", flush=True)
             else:
-                print(f"⚠️ stealth.js not found at {stealth_path}", flush=True)
+                print(f"⚠️  stealth.js not found at {stealth_path}", flush=True)
         except Exception as e:
-            print(f"⚠️ Could not load stealth.js: {e}", flush=True)
+            print(f"⚠️  Could not load stealth.js: {e}", flush=True)
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="networkidle", timeout=90000)
 
-            print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
+            print(f"📄 Page title: '{page.title()}'", flush=True)
 
-            # Try to wait for vue-rendered listing cards before scrolling
             listing_selectors = [
-                "a[href*='-d']",           # ouedkniss detail links like /iphone-13-d123456
+                "a[href*='/s/']",
+                "a[href*='-d']",
                 "a[href*='/annonces/']",
                 "[class*='announcement']",
+                "[class*='AnnouncementCard']",
                 "[class*='listing']",
-                "[class*='Announcement']",
                 ".v-card a",
                 "article a",
             ]
+            matched_sel = None
             for sel in listing_selectors:
                 try:
-                    page.wait_for_selector(sel, timeout=8000)
+                    page.wait_for_selector(sel, timeout=10000)
+                    matched_sel = sel
                     print(f"✅ Selector matched: {sel}", flush=True)
                     break
                 except Exception:
                     pass
-            else:
-                # None matched — give Vue extra time as last resort
-                print("⚠️  No listing selector matched, waiting extra 10s...", flush=True)
-                page.wait_for_timeout(10000)
 
-            # Smooth scrolling to trigger lazy loading
-            for i in range(5):
-                page.evaluate(f"window.scrollTo(0, {i * 1000})")
-                page.wait_for_timeout(800)
+            if not matched_sel:
+                print("⚠️  No listing selector matched — dumping page state to logs...", flush=True)
+                log_debug_html(page, f"page_{page_num}_no_selector")
+
+            for i in range(6):
+                page.evaluate(f"window.scrollTo(0, {i * 900})")
+                page.wait_for_timeout(700)
 
             page.wait_for_timeout(3000)
 
-            print(f"📄 Page Title loaded: {page.title()}", flush=True)
-
-            # Extract all links and their text for more robust parsing
             found_items = page.evaluate("""
                 () => {
                     const links = Array.from(document.querySelectorAll('a[href]'));
@@ -162,16 +186,11 @@ def get_listings_stealth(page_num: int = 1):
                 }
             """)
 
-            print(f"🔍 Found {len(found_items)} total links on page.", flush=True)
+            print(f"🔍 Found {len(found_items)} total links on page {page_num}.", flush=True)
 
             if len(found_items) == 0:
-                # Dump HTML excerpt to help diagnose bot-block / selector mismatch
-                html_snippet = page.evaluate("() => document.body.innerHTML.slice(0, 3000)")
-                dump_path = f"debug_page_{page_num}.html"
-                with open(dump_path, "w", encoding="utf-8") as f:
-                    f.write(html_snippet)
-                page.screenshot(path=f"debug_page_{page_num}.png")
-                print(f"🐛 Saved debug HTML/screenshot: {dump_path} / debug_page_{page_num}.png", flush=True)
+                log_debug_html(page, f"page_{page_num}_zero_links")
+                return []
 
             listings = []
             seen_urls = set()
@@ -181,15 +200,13 @@ def get_listings_stealth(page_num: int = 1):
                     href = item["href"] or ""
                     text = item["text"].strip()
 
-                    # Flexible listing detection (ouedkniss uses slugs like /iphone-13-d123456)
                     is_listing = (
-                        re.search(r"-d\d+", href) or
+                        re.search(r"-d\d+", href) is not None or
                         "/annonces/" in href or
                         "/détails-annonce-" in href or
-                        re.search(r"/[a-z0-9%-]+-d\d+", href) or
-                        (href.startswith("/%D") and len(href) > 20)
+                        re.search(r"/[a-z0-9%._-]+-d\d+", href) is not None
                     )
-                    
+
                     if not is_listing or not text or len(text) < 5:
                         continue
 
@@ -201,7 +218,6 @@ def get_listings_stealth(page_num: int = 1):
                     lines = [l.strip() for l in text.split("\n") if l.strip()]
                     title = lines[0] if lines else "Unknown"
 
-                    # Robust price parsing from multi-line text
                     price = "Check Link"
                     price_raw = None
                     for line in lines[1:]:
@@ -213,7 +229,6 @@ def get_listings_stealth(page_num: int = 1):
                                 price_raw = int(numeric)
                             break
                         elif any(c.isdigit() for c in clean) and 4 <= len(clean) <= 10:
-                            # Heuristic for prices without currency symbols
                             price = line.strip()
                             numeric = "".join(c for c in clean if c.isdigit())
                             if numeric:
@@ -231,15 +246,14 @@ def get_listings_stealth(page_num: int = 1):
                     print(f"⚠️  Error parsing item: {e}", flush=True)
                     continue
 
-            print(f"📦 Successfully extracted {len(listings)} listings from page {page_num}.", flush=True)
+            print(f"📦 Extracted {len(listings)} listings from page {page_num}.", flush=True)
             return listings
 
         except Exception as e:
             print(f"❌ Scrape failed (page {page_num}): {e}", flush=True)
-            # Take a screenshot on failure to help debug Render blocks
             try:
-                page.screenshot(path=f"error_page_{page_num}.png")
-            except:
+                log_debug_html(page, f"page_{page_num}_exception")
+            except Exception:
                 pass
             return []
         finally:
@@ -276,21 +290,20 @@ def process_item(item):
         )
         ai = json.loads(res.choices[0].message.content)
 
-        steal = ai.get("is_steal") if ai.get("is_steal") is not None else False
-        model = ai.get("model", "Unknown")
-        price_dzd = ai.get("price_dzd", 0) or 0
-        market = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
+        steal      = ai.get("is_steal") if ai.get("is_steal") is not None else False
+        model      = ai.get("model", "Unknown")
+        price_dzd  = ai.get("price_dzd", 0) or 0
+        market     = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 
         if steal:
             send_ntfy(
-                f"🚨 DEAL: {model}",
+                f"DEAL: {model}",
                 f"Price: {price_dzd:,} DZD (market ~{market:,} DZD)\n"
                 f"Reason: {ai.get('reason', '')}\n{item['url']}"
             )
 
-        # Ensure both keys are in metadata for frontend compatibility
         ai["estimated_market_price_dzd"] = market
         ai["market_price_dzd"] = market
 
@@ -324,10 +337,9 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v4.9 - Native Stealth Active (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v5.0 - Fixed URL + Render-safe debug (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
-    page_num = 1
     MAX_PAGES = 3
 
     while True:
