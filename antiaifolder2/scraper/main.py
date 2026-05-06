@@ -66,7 +66,8 @@ def is_seen(ext_id: str) -> bool:
 # ── Native Stealth Scraper ────────────────────────────────────────────────────
 
 def get_listings_stealth(page_num: int = 1):
-    url = f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone"
+    # ouedkniss search URL — page param is 0-indexed on the API but site uses page= query param
+    url = f"https://www.ouedkniss.com/recherche?q=iphone&page={page_num}"
     print(f"🌐 Launching browser for page {page_num}...", flush=True)
 
     with sync_playwright() as p:
@@ -115,15 +116,38 @@ def get_listings_stealth(page_num: int = 1):
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
+
+            # Try to wait for vue-rendered listing cards before scrolling
+            listing_selectors = [
+                "a[href*='-d']",           # ouedkniss detail links like /iphone-13-d123456
+                "a[href*='/annonces/']",
+                "[class*='announcement']",
+                "[class*='listing']",
+                "[class*='Announcement']",
+                ".v-card a",
+                "article a",
+            ]
+            for sel in listing_selectors:
+                try:
+                    page.wait_for_selector(sel, timeout=8000)
+                    print(f"✅ Selector matched: {sel}", flush=True)
+                    break
+                except Exception:
+                    pass
+            else:
+                # None matched — give Vue extra time as last resort
+                print("⚠️  No listing selector matched, waiting extra 10s...", flush=True)
+                page.wait_for_timeout(10000)
+
             # Smooth scrolling to trigger lazy loading
             for i in range(5):
                 page.evaluate(f"window.scrollTo(0, {i * 1000})")
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
 
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(3000)
 
             print(f"📄 Page Title loaded: {page.title()}", flush=True)
 
@@ -133,12 +157,21 @@ def get_listings_stealth(page_num: int = 1):
                     const links = Array.from(document.querySelectorAll('a[href]'));
                     return links.map(a => ({
                         href: a.getAttribute('href'),
-                        text: a.innerText
-                    }));
+                        text: a.innerText.trim()
+                    })).filter(x => x.href && x.href.length > 1);
                 }
             """)
 
             print(f"🔍 Found {len(found_items)} total links on page.", flush=True)
+
+            if len(found_items) == 0:
+                # Dump HTML excerpt to help diagnose bot-block / selector mismatch
+                html_snippet = page.evaluate("() => document.body.innerHTML.slice(0, 3000)")
+                dump_path = f"debug_page_{page_num}.html"
+                with open(dump_path, "w", encoding="utf-8") as f:
+                    f.write(html_snippet)
+                page.screenshot(path=f"debug_page_{page_num}.png")
+                print(f"🐛 Saved debug HTML/screenshot: {dump_path} / debug_page_{page_num}.png", flush=True)
 
             listings = []
             seen_urls = set()
@@ -148,11 +181,12 @@ def get_listings_stealth(page_num: int = 1):
                     href = item["href"] or ""
                     text = item["text"].strip()
 
-                    # Flexible listing detection
+                    # Flexible listing detection (ouedkniss uses slugs like /iphone-13-d123456)
                     is_listing = (
-                        re.search(r"-d\d+", href) or 
-                        "/annonces/" in href or 
+                        re.search(r"-d\d+", href) or
+                        "/annonces/" in href or
                         "/détails-annonce-" in href or
+                        re.search(r"/[a-z0-9%-]+-d\d+", href) or
                         (href.startswith("/%D") and len(href) > 20)
                     )
                     
