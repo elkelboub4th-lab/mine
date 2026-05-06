@@ -80,6 +80,10 @@ def get_listings_stealth(page_num: int = 1):
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
+        
+        # Log all failing requests or GraphQL requests to debug Render API blocks
+        page.on("response", lambda r: print(f"🔍 Network: {r.status} {r.url}", flush=True) if "graphql" in r.url or r.status >= 400 else None)
+        
         try:
             with open("stealth.js", "r", encoding="utf-8") as f:
                 page.add_init_script(f.read())
@@ -90,8 +94,13 @@ def get_listings_stealth(page_num: int = 1):
             print(f"📡 Navigating to: {url}", flush=True)
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            print("⏳ Waiting 8s for Vue to render listings...", flush=True)
-            page.wait_for_timeout(8000)
+            print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
+            try:
+                page.wait_for_selector("a[href]", timeout=30000)
+                page.wait_for_timeout(5000) # Give it 5s extra for listings XHR to populate
+            except Exception as e:
+                print(f"⚠️ Timeout waiting for Vue: {e}", flush=True)
+                print(f"📄 Body snapshot: {page.evaluate('document.body.innerText')[:500]}", flush=True)
 
             page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
             page.wait_for_timeout(1500)
