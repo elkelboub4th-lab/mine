@@ -115,18 +115,18 @@ def get_listings_stealth(page_num: int = 1):
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
             # Smooth scrolling to trigger lazy loading
             for i in range(5):
                 page.evaluate(f"window.scrollTo(0, {i * 1000})")
                 page.wait_for_timeout(1000)
-            
+
             page.wait_for_timeout(5000)
 
             print(f"📄 Page Title loaded: {page.title()}", flush=True)
-            
+
             # Extract links and text using evaluate to ensure we get the rendered state
             found_items = page.evaluate("""
                 () => {
@@ -137,7 +137,7 @@ def get_listings_stealth(page_num: int = 1):
                     }));
                 }
             """)
-            
+
             print(f"🔍 Found {len(found_items)} total links on page.", flush=True)
 
             listings = []
@@ -151,8 +151,8 @@ def get_listings_stealth(page_num: int = 1):
                     # Updated listing detection for Ouedkniss
                     # Matches slugs ending in -d[ID] or old style annonces/details
                     is_listing = (
-                        re.search(r"-d\d+$", href) or 
-                        "/annonces/" in href or 
+                        re.search(r"-d\d+", href) or
+                        "/annonces/" in href or
                         "/détails-annonce-" in href or
                         (href.startswith("/%D") and len(href) > 20)
                     )
@@ -235,10 +235,10 @@ def process_item(item):
         )
         ai = json.loads(res.choices[0].message.content)
 
-        steal = ai.get("is_steal", False)
+        steal = ai.get("is_steal") if ai.get("is_steal") is not None else False
         model = ai.get("model", "Unknown")
         price_dzd = ai.get("price_dzd", 0) or 0
-        market = ai.get("market_price_dzd", 0) or 0
+        market = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 

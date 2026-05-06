@@ -235,7 +235,7 @@ def process_item(item):
         )
         ai = json.loads(res.choices[0].message.content)
 
-        steal = ai.get("is_steal", False)
+        steal = ai.get("is_steal") if ai.get("is_steal") is not None else False
         model = ai.get("model", "Unknown")
         price_dzd = ai.get("price_dzd", 0) or 0
         market = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
