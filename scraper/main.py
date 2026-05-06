@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import re
 import hashlib
 import json
 import requests
@@ -62,9 +63,7 @@ def is_seen(ext_id: str) -> bool:
         print(f"⚠️  Supabase seen check error: {e}", flush=True)
         return False
 
-# ── Stealth Scraper ───────────────────────────────────────────────────────────
-# KEY FIX: Ouedkniss is a Vue SPA. Using domcontentloaded + 8s explicit wait
-# is the only reliable approach. networkidle fires too early on their CDN setup.
+# ── Native Stealth Scraper ────────────────────────────────────────────────────
 
 def get_listings_stealth(page_num: int = 1):
     url = f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone"
@@ -75,50 +74,87 @@ def get_listings_stealth(page_num: int = 1):
             headless=True,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
         )
+        import random
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ]
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent=random.choice(user_agents),
             locale="fr-DZ",
             timezone_id="Africa/Algiers",
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
 
+        # Log all failing requests or GraphQL requests to debug Render API blocks
+        page.on("response", lambda r: print(f"🔍 Network: {r.status} {r.url}", flush=True) if "graphql" in r.url or r.status >= 400 else None)
+
+        try:
+            # Inject opts object expected by stealth.js to avoid ReferenceError
+            opts_script = """
+            const opts = {
+                script_logging: false,
+                navigator_languages_override: ["fr-DZ", "fr"],
+                navigator_platform: "Win32",
+                navigator_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                navigator_vendor: "Google Inc.",
+                webgl_vendor: "Intel Inc.",
+                webgl_renderer: "Intel Iris OpenGL Engine"
+            };
+            """
+            stealth_path = os.path.join(os.path.dirname(__file__), "stealth.js")
+            if os.path.exists(stealth_path):
+                with open(stealth_path, "r", encoding="utf-8") as f:
+                    page.add_init_script(opts_script + f.read())
+            else:
+                print(f"⚠️ stealth.js not found at {stealth_path}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Could not load stealth.js: {e}", flush=True)
+
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            # domcontentloaded is key — networkidle fires before Vue renders listings
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # Wait for Vue.js router to process and render listing cards
-            print("⏳ Waiting 8s for Vue to render listings...", flush=True)
-            page.wait_for_timeout(8000)
+            print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
+            # Smooth scrolling to trigger lazy loading
+            for i in range(5):
+                page.evaluate(f"window.scrollTo(0, {i * 1000})")
+                page.wait_for_timeout(1000)
 
-            # Scroll to trigger lazy-loaded images / pagination
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(1500)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(5000)
 
-            # Collect all links
-            all_links = page.query_selector_all("a[href]")
-            print(f"🔍 Found {len(all_links)} total links on page.", flush=True)
+            print(f"📄 Page Title loaded: {page.title()}", flush=True)
+
+            # Extract links and text using evaluate to ensure we get the rendered state
+            found_items = page.evaluate("""
+                () => {
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    return links.map(a => ({
+                        href: a.getAttribute('href'),
+                        text: a.innerText
+                    }));
+                }
+            """)
+
+            print(f"🔍 Found {len(found_items)} total links on page.", flush=True)
 
             listings = []
             seen_urls = set()
 
-            for link in all_links:
+            for item in found_items:
                 try:
-                    href = link.get_attribute("href") or ""
-                    text = link.inner_text().strip()
+                    href = item["href"] or ""
+                    text = item["text"].strip()
 
-                    # Ouedkniss listing links: Arabic-encoded slugs starting with /%D
-                    # or direct slug paths that aren't navigation/store links
+                    # Updated listing detection for Ouedkniss
+                    # Matches slugs ending in -d[ID] or old style annonces/details
                     is_listing = (
-                        href.startswith("/%D") or  # Arabic encoded listing slug
-                        (href.startswith("/") and
-                         len(href) > 30 and           # Long slugs = listings
-                         "/store/" not in href and
-                         "/auth" not in href and
-                         "/categorie" not in href)
+                        re.search(r"-d\d+", href) or
+                        "/annonces/" in href or
+                        "/détails-annonce-" in href or
+                        (href.startswith("/%D") and len(href) > 20)
                     )
 
                     if not is_listing or not text or len(text) < 5:
@@ -130,18 +166,15 @@ def get_listings_stealth(page_num: int = 1):
                         continue
                     seen_urls.add(full_url)
 
-                    # Parse structured text from the card
                     lines = [l.strip() for l in text.split("\n") if l.strip()]
                     title = lines[0] if lines else "Unknown"
 
-                    # Find price line: contains digits and "دج" (DZD) or "DA"
                     price = "Check Link"
                     price_raw = None
                     for line in lines[1:]:
                         clean = line.replace(" ", "").replace("\xa0", "")
                         if ("دج" in line or "DA" in line.upper()) and any(c.isdigit() for c in clean):
                             price = line.strip()
-                            # Extract numeric value
                             numeric = "".join(c for c in clean if c.isdigit())
                             if numeric:
                                 price_raw = int(numeric)
@@ -188,7 +221,8 @@ def process_item(item):
         f"Return ONLY a JSON object with these exact keys:\n"
         f"- model: the iPhone model string (e.g. 'iPhone 13 Pro Max')\n"
         f"- price_dzd: integer price in Algerian Dinar (DZD), your best estimate\n"
-        f"- market_price_dzd: integer typical market price for this model in Algeria\n"
+        f"- estimated_market_price_dzd: integer typical market price for this model in Algeria\n"
+        f"- market_price_dzd: same as estimated_market_price_dzd\n"
         f"- is_steal: boolean, true if price is 20%+ below market value\n"
         f"- reason: one sentence explanation"
     )
@@ -203,8 +237,8 @@ def process_item(item):
 
         steal = ai.get("is_steal", False)
         model = ai.get("model", "Unknown")
-        price_dzd = ai.get("price_dzd", 0)
-        market = ai.get("market_price_dzd", 0)
+        price_dzd = ai.get("price_dzd", 0) or 0
+        market = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 
@@ -215,15 +249,20 @@ def process_item(item):
                 f"Reason: {ai.get('reason', '')}\n{item['url']}"
             )
 
-        supabase.table("listings").insert({
+        # Ensure both keys are in metadata for frontend compatibility
+        ai["estimated_market_price_dzd"] = market
+        ai["market_price_dzd"] = market
+
+        supabase.table("listings").upsert({
             "external_id": ext_id,
             "title": item["title"],
             "url": item["url"],
             "price": price_dzd,
+            "category": model,
             "is_steal": steal,
             "metadata": ai
-        }).execute()
-        supabase.table("seen_listings").insert({"external_id": ext_id}).execute()
+        }, on_conflict="external_id").execute()
+        supabase.table("seen_listings").upsert({"external_id": ext_id}, on_conflict="external_id").execute()
 
     except Exception as e:
         print(f"⚠️  AI/DB error for '{item['title'][:40]}': {e}", flush=True)
@@ -244,11 +283,11 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v4.6 - Stealth Mode Active (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v4.8 - Native Stealth Active (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     page_num = 1
-    MAX_PAGES = 3  # Scrape first 3 pages of results per cycle
+    MAX_PAGES = 3
 
     while True:
         print(f"\n{'='*60}", flush=True)

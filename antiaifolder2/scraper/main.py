@@ -74,8 +74,14 @@ def get_listings_stealth(page_num: int = 1):
             headless=True,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
         )
+        import random
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ]
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent=random.choice(user_agents),
             locale="fr-DZ",
             timezone_id="Africa/Algiers",
             viewport={"width": 1280, "height": 900}
@@ -109,7 +115,7 @@ def get_listings_stealth(page_num: int = 1):
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
             print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
             # Smooth scrolling to trigger lazy loading
@@ -145,7 +151,7 @@ def get_listings_stealth(page_num: int = 1):
                     # Updated listing detection for Ouedkniss
                     # Matches slugs ending in -d[ID] or old style annonces/details
                     is_listing = (
-                        re.search(r"-d\d+$", href) or
+                        re.search(r"-d\d+", href) or
                         "/annonces/" in href or
                         "/détails-annonce-" in href or
                         (href.startswith("/%D") and len(href) > 20)
@@ -215,7 +221,8 @@ def process_item(item):
         f"Return ONLY a JSON object with these exact keys:\n"
         f"- model: the iPhone model string (e.g. 'iPhone 13 Pro Max')\n"
         f"- price_dzd: integer price in Algerian Dinar (DZD), your best estimate\n"
-        f"- market_price_dzd: integer typical market price for this model in Algeria\n"
+        f"- estimated_market_price_dzd: integer typical market price for this model in Algeria\n"
+        f"- market_price_dzd: same as estimated_market_price_dzd\n"
         f"- is_steal: boolean, true if price is 20%+ below market value\n"
         f"- reason: one sentence explanation"
     )
@@ -231,7 +238,7 @@ def process_item(item):
         steal = ai.get("is_steal", False)
         model = ai.get("model", "Unknown")
         price_dzd = ai.get("price_dzd", 0) or 0
-        market = ai.get("market_price_dzd", 0) or 0
+        market = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 
@@ -242,15 +249,20 @@ def process_item(item):
                 f"Reason: {ai.get('reason', '')}\n{item['url']}"
             )
 
-        supabase.table("listings").insert({
+        # Ensure both keys are in metadata for frontend compatibility
+        ai["estimated_market_price_dzd"] = market
+        ai["market_price_dzd"] = market
+
+        supabase.table("listings").upsert({
             "external_id": ext_id,
             "title": item["title"],
             "url": item["url"],
             "price": price_dzd,
+            "category": model,
             "is_steal": steal,
             "metadata": ai
-        }).execute()
-        supabase.table("seen_listings").insert({"external_id": ext_id}).execute()
+        }, on_conflict="external_id").execute()
+        supabase.table("seen_listings").upsert({"external_id": ext_id}, on_conflict="external_id").execute()
 
     except Exception as e:
         print(f"⚠️  AI/DB error for '{item['title'][:40]}': {e}", flush=True)
@@ -271,7 +283,7 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v4.7 - Native Stealth Active (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v4.8 - Native Stealth Active (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     page_num = 1
