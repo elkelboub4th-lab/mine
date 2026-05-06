@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import re
 import hashlib
 import json
 import requests
@@ -85,47 +86,69 @@ def get_listings_stealth(page_num: int = 1):
         page.on("response", lambda r: print(f"🔍 Network: {r.status} {r.url}", flush=True) if "graphql" in r.url or r.status >= 400 else None)
         
         try:
-            with open("stealth.js", "r", encoding="utf-8") as f:
-                page.add_init_script(f.read())
+            # Inject opts object expected by stealth.js to avoid ReferenceError
+            opts_script = """
+            const opts = {
+                script_logging: false,
+                navigator_languages_override: ["fr-DZ", "fr"],
+                navigator_platform: "Win32",
+                navigator_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                navigator_vendor: "Google Inc.",
+                webgl_vendor: "Intel Inc.",
+                webgl_renderer: "Intel Iris OpenGL Engine"
+            };
+            """
+            stealth_path = os.path.join(os.path.dirname(__file__), "stealth.js")
+            if os.path.exists(stealth_path):
+                with open(stealth_path, "r", encoding="utf-8") as f:
+                    page.add_init_script(opts_script + f.read())
+            else:
+                print(f"⚠️ stealth.js not found at {stealth_path}", flush=True)
         except Exception as e:
             print(f"⚠️ Could not load stealth.js: {e}", flush=True)
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="networkidle", timeout=60000)
 
             print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
-            try:
-                page.wait_for_selector("a[href]", timeout=30000)
-                page.wait_for_timeout(5000) # Give it 5s extra for listings XHR to populate
-            except Exception as e:
-                print(f"⚠️ Timeout waiting for Vue: {e}", flush=True)
-                print(f"📄 Body snapshot: {page.evaluate('document.body.innerText')[:500]}", flush=True)
+            # Smooth scrolling to trigger lazy loading
+            for i in range(5):
+                page.evaluate(f"window.scrollTo(0, {i * 1000})")
+                page.wait_for_timeout(1000)
 
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(1500)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(5000)
 
             print(f"📄 Page Title loaded: {page.title()}", flush=True)
-            all_links = page.query_selector_all("a[href]")
-            print(f"🔍 Found {len(all_links)} total links on page.", flush=True)
+
+            # Extract links and text using evaluate to ensure we get the rendered state
+            found_items = page.evaluate("""
+                () => {
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    return links.map(a => ({
+                        href: a.getAttribute('href'),
+                        text: a.innerText
+                    }));
+                }
+            """)
+
+            print(f"🔍 Found {len(found_items)} total links on page.", flush=True)
 
             listings = []
             seen_urls = set()
 
-            for link in all_links:
+            for item in found_items:
                 try:
-                    href = link.get_attribute("href") or ""
-                    text = link.inner_text().strip()
+                    href = item["href"] or ""
+                    text = item["text"].strip()
 
+                    # Updated listing detection for Ouedkniss
+                    # Matches slugs ending in -d[ID] or old style annonces/details
                     is_listing = (
-                        href.startswith("/%D") or  
-                        (href.startswith("/") and
-                         len(href) > 30 and           
-                         "/store/" not in href and
-                         "/auth" not in href and
-                         "/categorie" not in href)
+                        re.search(r"-d\d+$", href) or
+                        "/annonces/" in href or
+                        "/détails-annonce-" in href or
+                        (href.startswith("/%D") and len(href) > 20)
                     )
 
                     if not is_listing or not text or len(text) < 5:
@@ -207,8 +230,8 @@ def process_item(item):
 
         steal = ai.get("is_steal", False)
         model = ai.get("model", "Unknown")
-        price_dzd = ai.get("price_dzd", 0)
-        market = ai.get("market_price_dzd", 0)
+        price_dzd = ai.get("price_dzd", 0) or 0
+        market = ai.get("market_price_dzd", 0) or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 
