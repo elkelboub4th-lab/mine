@@ -115,7 +115,7 @@ def get_listings_stealth(page_num: int = 1):
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(url, wait_until="networkidle", timeout=60000)
 
             print("⏳ Waiting up to 30s for Vue to render links...", flush=True)
             # Smooth scrolling to trigger lazy loading
@@ -283,7 +283,7 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v4.8 - Native Stealth Active (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v4.9 - Native Stealth Active (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     page_num = 1
