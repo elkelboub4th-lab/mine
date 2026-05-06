@@ -9,7 +9,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
-# ── Fix emoji output ──────────────────────────────────────────────────────────
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
@@ -18,7 +17,6 @@ load_dotenv()
 from supabase import create_client, Client
 from groq import Groq
 
-# ── Configuration ─────────────────────────────────────────────────────────────
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -31,7 +29,6 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 GRAPHQL_URL = "https://api.ouedkniss.com/graphql"
 
 USER_AGENTS = [
@@ -41,6 +38,23 @@ USER_AGENTS = [
 ]
 
 SEARCH_QUERY = """
+query SearchAnnouncements($query: String!, $page: Int, $count: Int) {
+  search(query: $query, page: $page, count: $count) {
+    announcements {
+      id
+      slug
+      title
+      price
+      priceUnit
+      priceType
+      updatedAt
+    }
+    totalCount
+  }
+}
+"""
+
+SEARCH_QUERY_V2 = """
 query AnnouncementSearch($q: String, $page: Int, $count: Int) {
   announcementSearch(q: $q, page: $page, count: $count) {
     announcements {
@@ -50,21 +64,28 @@ query AnnouncementSearch($q: String, $page: Int, $count: Int) {
       price
       priceUnit
       priceType
-      description
       updatedAt
-      store {
-        slug
-        name
-      }
     }
     totalCount
-    page
-    count
   }
 }
 """
 
-# ── Notifications & DB ────────────────────────────────────────────────────────
+def make_session():
+    ua = random.choice(USER_AGENTS)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": ua,
+        "Accept-Language": "fr-DZ,fr;q=0.9,ar;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    try:
+        print("🍪 Fetching session cookies from ouedkniss.com...", flush=True)
+        r = session.get("https://www.ouedkniss.com", timeout=20)
+        print(f"🍪 Homepage status: {r.status_code} | cookies: {list(session.cookies.keys())}", flush=True)
+    except Exception as e:
+        print(f"⚠️  Could not fetch homepage cookies: {e}", flush=True)
+    return session, ua
 
 def send_ntfy(title, body):
     try:
@@ -93,92 +114,75 @@ def is_seen(ext_id: str) -> bool:
         print(f"⚠️  Supabase seen check error: {e}", flush=True)
         return False
 
-# ── Direct GraphQL Scraper (no browser needed) ────────────────────────────────
-
-def get_listings_api(page_num: int = 1):
-    print(f"🌐 Fetching page {page_num} via GraphQL API...", flush=True)
-
+def try_graphql(session, ua, query, variables, label):
     headers = {
         "Content-Type": "application/json",
-        "Origin": "https://www.ouedkniss.com",
-        "Referer": f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone",
-        "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json",
+        "Origin": "https://www.ouedkniss.com",
+        "Referer": "https://www.ouedkniss.com/",
+        "User-Agent": ua,
         "Accept-Language": "fr-DZ,fr;q=0.9,ar;q=0.8",
         "apollographql-client-name": "web",
         "apollographql-client-version": "1.0.0",
+        "x-requested-with": "XMLHttpRequest",
     }
+    payload = {"query": query, "variables": variables}
+    resp = session.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
+    raw = resp.text.strip()
+    print(f"📡 [{label}] status={resp.status_code} body_len={len(raw)} preview={raw[:200]}", flush=True)
+    if not raw:
+        return None
+    return resp.json()
 
-    payload = {
-        "operationName": "AnnouncementSearch",
-        "query": SEARCH_QUERY,
-        "variables": {
-            "q": "iphone",
-            "page": page_num,
-            "count": 40
-        }
-    }
+def get_listings_api(session, ua, page_num: int = 1):
+    print(f"🌐 Fetching page {page_num}...", flush=True)
+
+    announcements = []
 
     try:
-        resp = requests.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
-        print(f"📡 API status: {resp.status_code}", flush=True)
+        data = try_graphql(session, ua, SEARCH_QUERY_V2,
+                           {"q": "iphone", "page": page_num, "count": 40},
+                           "announcementSearch")
+        if data:
+            announcements = (data.get("data") or {}).get("announcementSearch", {}).get("announcements") or []
+    except Exception as e:
+        print(f"⚠️  announcementSearch failed: {e}", flush=True)
 
-        if resp.status_code != 200:
-            print(f"❌ API error {resp.status_code}: {resp.text[:500]}", flush=True)
-            return []
+    if not announcements:
+        try:
+            data = try_graphql(session, ua, SEARCH_QUERY,
+                               {"query": "iphone", "page": page_num, "count": 40},
+                               "search")
+            if data:
+                announcements = (data.get("data") or {}).get("search", {}).get("announcements") or []
+        except Exception as e:
+            print(f"⚠️  search failed: {e}", flush=True)
 
-        data = resp.json()
+    print(f"📦 Got {len(announcements)} announcements (page {page_num}).", flush=True)
 
-        if "errors" in data:
-            print(f"⚠️  GraphQL errors: {json.dumps(data['errors'], ensure_ascii=False)}", flush=True)
+    listings = []
+    for ann in announcements:
+        try:
+            title     = ann.get("title") or "Unknown"
+            price_val = ann.get("price")
+            unit      = ann.get("priceUnit") or "DZD"
+            slug      = ann.get("slug") or ""
 
-        announcements = (
-            data.get("data", {})
-                .get("announcementSearch", {})
-                .get("announcements", [])
-        )
-
-        if announcements is None:
-            announcements = []
-
-        print(f"📦 Got {len(announcements)} announcements from API (page {page_num}).", flush=True)
-
-        listings = []
-        for ann in announcements:
+            price_str = f"{price_val} {unit}" if price_val is not None else "Check Link"
             try:
-                title     = ann.get("title") or "Unknown"
-                price_val = ann.get("price")
-                unit      = ann.get("priceUnit") or "DZD"
-                slug      = ann.get("slug") or ""
+                price_raw = int(float(price_val)) if price_val is not None else None
+            except (ValueError, TypeError):
+                price_raw = None
 
-                price_str = f"{price_val} {unit}" if price_val is not None else "Check Link"
-                try:
-                    price_raw = int(float(price_val)) if price_val is not None else None
-                except (ValueError, TypeError):
-                    price_raw = None
-
-                if not slug or not title:
-                    continue
-
-                full_url = f"https://www.ouedkniss.com/{slug}"
-
-                listings.append({
-                    "title": title,
-                    "price": price_str,
-                    "price_raw": price_raw,
-                    "url": full_url
-                })
-            except Exception as e:
-                print(f"⚠️  Parse error: {e}", flush=True)
+            if not slug or not title:
                 continue
 
-        return listings
+            full_url = f"https://www.ouedkniss.com/{slug}"
+            listings.append({"title": title, "price": price_str, "price_raw": price_raw, "url": full_url})
+        except Exception as e:
+            print(f"⚠️  Parse error: {e}", flush=True)
 
-    except Exception as e:
-        print(f"❌ API call failed (page {page_num}): {e}", flush=True)
-        return []
-
-# ── AI Processing ─────────────────────────────────────────────────────────────
+    return listings
 
 def process_item(item):
     ext_id = hashlib.md5(item["url"].encode()).hexdigest()
@@ -220,6 +224,7 @@ def process_item(item):
                 f"DEAL: {model}",
                 f"Price: {price_dzd:,} DZD (market ~{market:,} DZD)\n"
                 f"Reason: {ai.get('reason', '')}\n{item['url']}"
+
             )
 
         ai["estimated_market_price_dzd"] = market
@@ -239,8 +244,6 @@ def process_item(item):
     except Exception as e:
         print(f"⚠️  AI/DB error for '{item['title'][:40]}': {e}", flush=True)
 
-# ── Health Server & Main Loop ─────────────────────────────────────────────────
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -255,7 +258,7 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v6.0 - Direct GraphQL API (no browser) (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v6.1 - GraphQL + session cookies (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     MAX_PAGES = 3
@@ -264,9 +267,11 @@ if __name__ == "__main__":
         print(f"\n{'='*60}", flush=True)
         print(f"🔄 Starting scrape cycle — pages 1-{MAX_PAGES}", flush=True)
 
+        session, ua = make_session()
+
         for page_num in range(1, MAX_PAGES + 1):
             try:
-                items = get_listings_api(page_num)
+                items = get_listings_api(session, ua, page_num)
                 new_count = 0
                 for item in items:
                     ext_id = hashlib.md5(item["url"].encode()).hexdigest()
