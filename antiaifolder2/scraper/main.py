@@ -87,10 +87,10 @@ def get_listings_stealth(page_num: int = 1):
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
-        
+
         # Log all failing requests or GraphQL requests to debug Render API blocks
         page.on("response", lambda r: print(f"🔍 Network: {r.status} {r.url}", flush=True) if "graphql" in r.url or r.status >= 400 else None)
-        
+
         try:
             # Inject opts object expected by stealth.js to avoid ReferenceError
             opts_script = """
@@ -122,12 +122,12 @@ def get_listings_stealth(page_num: int = 1):
             for i in range(5):
                 page.evaluate(f"window.scrollTo(0, {i * 1000})")
                 page.wait_for_timeout(1000)
-            
+
             page.wait_for_timeout(5000)
 
             print(f"📄 Page Title loaded: {page.title()}", flush=True)
-            
-            # Extract links and text using evaluate to ensure we get the rendered state
+
+            # Extract all links and their text for more robust parsing
             found_items = page.evaluate("""
                 () => {
                     const links = Array.from(document.querySelectorAll('a[href]'));
@@ -137,7 +137,7 @@ def get_listings_stealth(page_num: int = 1):
                     }));
                 }
             """)
-            
+
             print(f"🔍 Found {len(found_items)} total links on page.", flush=True)
 
             listings = []
@@ -148,20 +148,18 @@ def get_listings_stealth(page_num: int = 1):
                     href = item["href"] or ""
                     text = item["text"].strip()
 
-                    # Updated listing detection for Ouedkniss
-                    # Matches slugs ending in -d[ID] or old style annonces/details
+                    # Flexible listing detection
                     is_listing = (
-                        re.search(r"-d\d+$", href) or 
+                        re.search(r"-d\d+", href) or 
                         "/annonces/" in href or 
                         "/détails-annonce-" in href or
                         (href.startswith("/%D") and len(href) > 20)
                     )
-
+                    
                     if not is_listing or not text or len(text) < 5:
                         continue
 
                     full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
-
                     if full_url in seen_urls:
                         continue
                     seen_urls.add(full_url)
@@ -169,6 +167,7 @@ def get_listings_stealth(page_num: int = 1):
                     lines = [l.strip() for l in text.split("\n") if l.strip()]
                     title = lines[0] if lines else "Unknown"
 
+                    # Robust price parsing from multi-line text
                     price = "Check Link"
                     price_raw = None
                     for line in lines[1:]:
@@ -179,7 +178,8 @@ def get_listings_stealth(page_num: int = 1):
                             if numeric:
                                 price_raw = int(numeric)
                             break
-                        elif any(c.isdigit() for c in clean) and len(clean) >= 4 and len(clean) <= 10:
+                        elif any(c.isdigit() for c in clean) and 4 <= len(clean) <= 10:
+                            # Heuristic for prices without currency symbols
                             price = line.strip()
                             numeric = "".join(c for c in clean if c.isdigit())
                             if numeric:
@@ -193,14 +193,20 @@ def get_listings_stealth(page_num: int = 1):
                         "url": full_url
                     })
 
-                except Exception:
+                except Exception as e:
+                    print(f"⚠️  Error parsing item: {e}", flush=True)
                     continue
 
-            print(f"📦 Extracted {len(listings)} unique listings from page {page_num}.", flush=True)
+            print(f"📦 Successfully extracted {len(listings)} listings from page {page_num}.", flush=True)
             return listings
 
         except Exception as e:
             print(f"❌ Scrape failed (page {page_num}): {e}", flush=True)
+            # Take a screenshot on failure to help debug Render blocks
+            try:
+                page.screenshot(path=f"error_page_{page_num}.png")
+            except:
+                pass
             return []
         finally:
             browser.close()
@@ -210,6 +216,7 @@ def get_listings_stealth(page_num: int = 1):
 def process_item(item):
     ext_id = hashlib.md5(item["url"].encode()).hexdigest()
     if is_seen(ext_id):
+        print(f"   (Skipping seen: {item['title'][:30]}...)", flush=True)
         return
 
     print(f"🆕 New: {item['title'][:60]} — {item['price']}", flush=True)
@@ -235,10 +242,10 @@ def process_item(item):
         )
         ai = json.loads(res.choices[0].message.content)
 
-        steal = ai.get("is_steal", False)
+        steal = ai.get("is_steal") if ai.get("is_steal") is not None else False
         model = ai.get("model", "Unknown")
         price_dzd = ai.get("price_dzd", 0) or 0
-        market = ai.get("market_price_dzd", 0) or 0
+        market = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 
@@ -283,11 +290,11 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v4.8 - Native Stealth Active (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v4.9 - Native Stealth Active (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     page_num = 1
-    MAX_PAGES = 3  
+    MAX_PAGES = 3
 
     while True:
         print(f"\n{'='*60}", flush=True)
