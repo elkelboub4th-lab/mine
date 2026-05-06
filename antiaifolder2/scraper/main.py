@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import re
 import hashlib
 import json
 import random
@@ -10,15 +9,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 
-# ── Fix emoji output on Windows (cp1252 → utf-8) ─────────────────────────────
+# ── Fix emoji output ──────────────────────────────────────────────────────────
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# Load .env BEFORE importing clients that need env vars
 load_dotenv()
 
 from supabase import create_client, Client
-from playwright.sync_api import sync_playwright
 from groq import Groq
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -33,6 +30,39 @@ if not all([SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY, NTFY_TOPIC]):
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+GRAPHQL_URL = "https://api.ouedkniss.com/graphql"
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+SEARCH_QUERY = """
+query AnnouncementSearch($q: String, $page: Int, $count: Int) {
+  announcementSearch(q: $q, page: $page, count: $count) {
+    announcements {
+      id
+      slug
+      title
+      price
+      priceUnit
+      priceType
+      description
+      updatedAt
+      store {
+        slug
+        name
+      }
+    }
+    totalCount
+    page
+    count
+  }
+}
+"""
 
 # ── Notifications & DB ────────────────────────────────────────────────────────
 
@@ -63,208 +93,96 @@ def is_seen(ext_id: str) -> bool:
         print(f"⚠️  Supabase seen check error: {e}", flush=True)
         return False
 
-# ── Debug helpers (Render-safe: log to stdout instead of files) ───────────────
+# ── Direct GraphQL Scraper (no browser needed) ────────────────────────────────
 
-def log_debug_html(page, label: str):
-    """Dump page HTML + title to stdout so it appears in Render logs."""
+def get_listings_api(page_num: int = 1):
+    print(f"🌐 Fetching page {page_num} via GraphQL API...", flush=True)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://www.ouedkniss.com",
+        "Referer": f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone",
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json",
+        "Accept-Language": "fr-DZ,fr;q=0.9,ar;q=0.8",
+        "apollographql-client-name": "web",
+        "apollographql-client-version": "1.0.0",
+    }
+
+    payload = {
+        "operationName": "AnnouncementSearch",
+        "query": SEARCH_QUERY,
+        "variables": {
+            "q": "iphone",
+            "page": page_num,
+            "count": 40
+        }
+    }
+
     try:
-        title = page.title()
-        html  = page.evaluate("() => document.body.innerHTML.slice(0, 4000)")
-        print(f"\n🐛 DEBUG [{label}] title='{title}'", flush=True)
-        print(f"🐛 DEBUG [{label}] body_html_head:\n{html[:2000]}", flush=True)
-    except Exception as e:
-        print(f"⚠️  log_debug_html error: {e}", flush=True)
+        resp = requests.post(GRAPHQL_URL, json=payload, headers=headers, timeout=30)
+        print(f"📡 API status: {resp.status_code}", flush=True)
 
-# ── Native Stealth Scraper ────────────────────────────────────────────────────
+        if resp.status_code != 200:
+            print(f"❌ API error {resp.status_code}: {resp.text[:500]}", flush=True)
+            return []
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
+        data = resp.json()
 
-def get_listings_stealth(page_num: int = 1):
-    url = f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone"
-    print(f"🌐 Launching browser for page {page_num}: {url}", flush=True)
+        if "errors" in data:
+            print(f"⚠️  GraphQL errors: {json.dumps(data['errors'], ensure_ascii=False)}", flush=True)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-            ]
+        announcements = (
+            data.get("data", {})
+                .get("announcementSearch", {})
+                .get("announcements", [])
         )
-        context = browser.new_context(
-            user_agent=random.choice(USER_AGENTS),
-            locale="fr-DZ",
-            timezone_id="Africa/Algiers",
-            viewport={"width": 1280, "height": 900},
-            extra_http_headers={
-                "Accept-Language": "fr-DZ,fr;q=0.9,en;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            }
-        )
-        page = context.new_page()
 
-        def on_response(r):
-            if "graphql" in r.url:
-                print(f"🔍 GraphQL {r.status}: {r.url}", flush=True)
-            elif r.status >= 400:
-                print(f"⚠️  HTTP {r.status}: {r.url}", flush=True)
-        page.on("response", on_response)
+        if announcements is None:
+            announcements = []
 
-        try:
-            opts_script = """
-            const opts = {
-                script_logging: false,
-                navigator_languages_override: ["fr-DZ", "fr"],
-                navigator_platform: "Win32",
-                navigator_user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                navigator_vendor: "Google Inc.",
-                webgl_vendor: "Intel Inc.",
-                webgl_renderer: "Intel Iris OpenGL Engine"
-            };
-            """
-            stealth_path = os.path.join(os.path.dirname(__file__), "stealth.js")
-            if os.path.exists(stealth_path):
-                with open(stealth_path, "r", encoding="utf-8") as f:
-                    page.add_init_script(opts_script + f.read())
-                print("✅ stealth.js loaded", flush=True)
-            else:
-                print(f"⚠️  stealth.js not found at {stealth_path}", flush=True)
-        except Exception as e:
-            print(f"⚠️  Could not load stealth.js: {e}", flush=True)
+        print(f"📦 Got {len(announcements)} announcements from API (page {page_num}).", flush=True)
 
-        try:
-            print(f"📡 Navigating to: {url}", flush=True)
-            page.goto(url, wait_until="networkidle", timeout=90000)
+        listings = []
+        for ann in announcements:
+            try:
+                title     = ann.get("title") or "Unknown"
+                price_val = ann.get("price")
+                unit      = ann.get("priceUnit") or "DZD"
+                slug      = ann.get("slug") or ""
 
-            print(f"📄 Page title: '{page.title()}'", flush=True)
-
-            listing_selectors = [
-                "a[href*='/s/']",
-                "a[href*='-d']",
-                "a[href*='/annonces/']",
-                "[class*='announcement']",
-                "[class*='AnnouncementCard']",
-                "[class*='listing']",
-                ".v-card a",
-                "article a",
-            ]
-            matched_sel = None
-            for sel in listing_selectors:
+                price_str = f"{price_val} {unit}" if price_val is not None else "Check Link"
                 try:
-                    page.wait_for_selector(sel, timeout=10000)
-                    matched_sel = sel
-                    print(f"✅ Selector matched: {sel}", flush=True)
-                    break
-                except Exception:
-                    pass
-
-            if not matched_sel:
-                print("⚠️  No listing selector matched — dumping page state to logs...", flush=True)
-                log_debug_html(page, f"page_{page_num}_no_selector")
-
-            for i in range(6):
-                page.evaluate(f"window.scrollTo(0, {i * 900})")
-                page.wait_for_timeout(700)
-
-            page.wait_for_timeout(3000)
-
-            found_items = page.evaluate("""
-                () => {
-                    const links = Array.from(document.querySelectorAll('a[href]'));
-                    return links.map(a => ({
-                        href: a.getAttribute('href'),
-                        text: a.innerText.trim()
-                    })).filter(x => x.href && x.href.length > 1);
-                }
-            """)
-
-            print(f"🔍 Found {len(found_items)} total links on page {page_num}.", flush=True)
-
-            if len(found_items) == 0:
-                log_debug_html(page, f"page_{page_num}_zero_links")
-                return []
-
-            listings = []
-            seen_urls = set()
-
-            for item in found_items:
-                try:
-                    href = item["href"] or ""
-                    text = item["text"].strip()
-
-                    is_listing = (
-                        re.search(r"-d\d+", href) is not None or
-                        "/annonces/" in href or
-                        "/détails-annonce-" in href or
-                        re.search(r"/[a-z0-9%._-]+-d\d+", href) is not None
-                    )
-
-                    if not is_listing or not text or len(text) < 5:
-                        continue
-
-                    full_url = f"https://www.ouedkniss.com{href}" if href.startswith("/") else href
-                    if full_url in seen_urls:
-                        continue
-                    seen_urls.add(full_url)
-
-                    lines = [l.strip() for l in text.split("\n") if l.strip()]
-                    title = lines[0] if lines else "Unknown"
-
-                    price = "Check Link"
+                    price_raw = int(float(price_val)) if price_val is not None else None
+                except (ValueError, TypeError):
                     price_raw = None
-                    for line in lines[1:]:
-                        clean = line.replace(" ", "").replace("\xa0", "")
-                        if ("دج" in line or "DA" in line.upper()) and any(c.isdigit() for c in clean):
-                            price = line.strip()
-                            numeric = "".join(c for c in clean if c.isdigit())
-                            if numeric:
-                                price_raw = int(numeric)
-                            break
-                        elif any(c.isdigit() for c in clean) and 4 <= len(clean) <= 10:
-                            price = line.strip()
-                            numeric = "".join(c for c in clean if c.isdigit())
-                            if numeric:
-                                price_raw = int(numeric)
-                            break
 
-                    listings.append({
-                        "title": title,
-                        "price": price,
-                        "price_raw": price_raw,
-                        "url": full_url
-                    })
-
-                except Exception as e:
-                    print(f"⚠️  Error parsing item: {e}", flush=True)
+                if not slug or not title:
                     continue
 
-            print(f"📦 Extracted {len(listings)} listings from page {page_num}.", flush=True)
-            return listings
+                full_url = f"https://www.ouedkniss.com/{slug}"
 
-        except Exception as e:
-            print(f"❌ Scrape failed (page {page_num}): {e}", flush=True)
-            try:
-                log_debug_html(page, f"page_{page_num}_exception")
-            except Exception:
-                pass
-            return []
-        finally:
-            browser.close()
+                listings.append({
+                    "title": title,
+                    "price": price_str,
+                    "price_raw": price_raw,
+                    "url": full_url
+                })
+            except Exception as e:
+                print(f"⚠️  Parse error: {e}", flush=True)
+                continue
+
+        return listings
+
+    except Exception as e:
+        print(f"❌ API call failed (page {page_num}): {e}", flush=True)
+        return []
 
 # ── AI Processing ─────────────────────────────────────────────────────────────
 
 def process_item(item):
     ext_id = hashlib.md5(item["url"].encode()).hexdigest()
     if is_seen(ext_id):
-        print(f"   (Skipping seen: {item['title'][:30]}...)", flush=True)
         return
 
     print(f"🆕 New: {item['title'][:60]} — {item['price']}", flush=True)
@@ -290,10 +208,10 @@ def process_item(item):
         )
         ai = json.loads(res.choices[0].message.content)
 
-        steal      = ai.get("is_steal") if ai.get("is_steal") is not None else False
-        model      = ai.get("model", "Unknown")
-        price_dzd  = ai.get("price_dzd", 0) or 0
-        market     = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
+        steal     = ai.get("is_steal") if ai.get("is_steal") is not None else False
+        model     = ai.get("model", "Unknown")
+        price_dzd = ai.get("price_dzd", 0) or 0
+        market    = ai.get("estimated_market_price_dzd") or ai.get("market_price_dzd") or 0
 
         print(f"   🤖 {model} | {price_dzd:,} DZD (market: {market:,}) | steal={steal}", flush=True)
 
@@ -337,7 +255,7 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v5.0 - Fixed URL + Render-safe debug (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v6.0 - Direct GraphQL API (no browser) (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     MAX_PAGES = 3
@@ -348,7 +266,7 @@ if __name__ == "__main__":
 
         for page_num in range(1, MAX_PAGES + 1):
             try:
-                items = get_listings_stealth(page_num)
+                items = get_listings_api(page_num)
                 new_count = 0
                 for item in items:
                     ext_id = hashlib.md5(item["url"].encode()).hexdigest()
