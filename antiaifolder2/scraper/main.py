@@ -17,7 +17,6 @@ load_dotenv()
 
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 from groq import Groq
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -81,7 +80,11 @@ def get_listings_stealth(page_num: int = 1):
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
-        stealth_sync(page)
+        try:
+            with open("stealth.js", "r", encoding="utf-8") as f:
+                page.add_init_script(f.read())
+        except Exception as e:
+            print(f"⚠️ Could not load stealth.js: {e}", flush=True)
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
