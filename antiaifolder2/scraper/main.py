@@ -17,7 +17,7 @@ load_dotenv()
 
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth
+from playwright_stealth import stealth_sync
 from groq import Groq
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ def get_listings_stealth(page_num: int = 1):
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
-        Stealth(page)
+        stealth_sync(page)
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
