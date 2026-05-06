@@ -17,6 +17,7 @@ load_dotenv()
 
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 from groq import Groq
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -80,15 +81,7 @@ def get_listings_stealth(page_num: int = 1):
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
-        
-        # ── Native Stealth Injection ──
-        # This replaces the broken playwright-stealth library perfectly
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', {get: () => ['fr-DZ', 'fr', 'en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-        """)
+        stealth_sync(page)
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
