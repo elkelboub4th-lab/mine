@@ -17,7 +17,6 @@ load_dotenv()
 
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 from groq import Groq
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -63,9 +62,7 @@ def is_seen(ext_id: str) -> bool:
         print(f"⚠️  Supabase seen check error: {e}", flush=True)
         return False
 
-# ── Stealth Scraper ───────────────────────────────────────────────────────────
-# KEY FIX: Ouedkniss is a Vue SPA. Using domcontentloaded + 8s explicit wait
-# is the only reliable approach. networkidle fires too early on their CDN setup.
+# ── Native Stealth Scraper ────────────────────────────────────────────────────
 
 def get_listings_stealth(page_num: int = 1):
     url = f"https://www.ouedkniss.com/s/{page_num}?keywords=iphone"
@@ -83,24 +80,28 @@ def get_listings_stealth(page_num: int = 1):
             viewport={"width": 1280, "height": 900}
         )
         page = context.new_page()
-        stealth_sync(page)
+        
+        # ── Native Stealth Injection ──
+        # This replaces the broken playwright-stealth library perfectly
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['fr-DZ', 'fr', 'en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """)
 
         try:
             print(f"📡 Navigating to: {url}", flush=True)
-            # domcontentloaded is key — networkidle fires before Vue renders listings
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-            # Wait for Vue.js router to process and render listing cards
             print("⏳ Waiting 8s for Vue to render listings...", flush=True)
             page.wait_for_timeout(8000)
 
-            # Scroll to trigger lazy-loaded images / pagination
             page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
             page.wait_for_timeout(1500)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1500)
 
-            # Collect all links
             print(f"📄 Page Title loaded: {page.title()}", flush=True)
             all_links = page.query_selector_all("a[href]")
             print(f"🔍 Found {len(all_links)} total links on page.", flush=True)
@@ -113,12 +114,10 @@ def get_listings_stealth(page_num: int = 1):
                     href = link.get_attribute("href") or ""
                     text = link.inner_text().strip()
 
-                    # Ouedkniss listing links: Arabic-encoded slugs starting with /%D
-                    # or direct slug paths that aren't navigation/store links
                     is_listing = (
-                        href.startswith("/%D") or  # Arabic encoded listing slug
+                        href.startswith("/%D") or  
                         (href.startswith("/") and
-                         len(href) > 30 and           # Long slugs = listings
+                         len(href) > 30 and           
                          "/store/" not in href and
                          "/auth" not in href and
                          "/categorie" not in href)
@@ -133,18 +132,15 @@ def get_listings_stealth(page_num: int = 1):
                         continue
                     seen_urls.add(full_url)
 
-                    # Parse structured text from the card
                     lines = [l.strip() for l in text.split("\n") if l.strip()]
                     title = lines[0] if lines else "Unknown"
 
-                    # Find price line: contains digits and "دج" (DZD) or "DA"
                     price = "Check Link"
                     price_raw = None
                     for line in lines[1:]:
                         clean = line.replace(" ", "").replace("\xa0", "")
                         if ("دج" in line or "DA" in line.upper()) and any(c.isdigit() for c in clean):
                             price = line.strip()
-                            # Extract numeric value
                             numeric = "".join(c for c in clean if c.isdigit())
                             if numeric:
                                 price_raw = int(numeric)
@@ -247,11 +243,11 @@ if __name__ == "__main__":
         target=lambda: HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-    print(f"🚀 SwoopDZ v4.6 - Stealth Mode Active (health :{port})", flush=True)
+    print(f"🚀 SwoopDZ v4.7 - Native Stealth Active (health :{port})", flush=True)
     print(f"🔔 Alerts → ntfy.sh/{NTFY_TOPIC}", flush=True)
 
     page_num = 1
-    MAX_PAGES = 3  # Scrape first 3 pages of results per cycle
+    MAX_PAGES = 3  
 
     while True:
         print(f"\n{'='*60}", flush=True)
